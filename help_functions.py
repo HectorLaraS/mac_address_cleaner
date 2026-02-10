@@ -40,24 +40,27 @@ exec_handler.setFormatter(
 )
 exec_logger.addHandler(exec_handler)
 
-def get_endpoints():
+def get_endpoints(api_user: str | None = None, api_pass: str | None = None):
     api_fetch_time = datetime.now()
+
+    user = api_user or API_USER
+    pwd  = api_pass or API_PASS
 
     t_fetch_start = time.perf_counter()
     try:
-        req = requests.get(API_URL,auth=(API_USER,API_PASS), verify=False,timeout=30)
+        req = requests.get(API_URL, auth=(user, pwd), verify=False, timeout=30)
 
         if req.status_code == 401:
             raise APIException("Username or Password error (401)")
-        
+
         if req.status_code != 200:
-                raise APIException(f"unexpected response: {req.status_code}")
-        
+            raise APIException(f"unexpected response: {req.status_code}")
+
         payload = req.json()
 
         t_fetch_end = time.perf_counter()
         exec_logger.info(
-            f"user running: {API_USER} | "
+            f"user running: {user} | "
             f"API fetch at {api_fetch_time.isoformat()} | "
             f"Endpoints={len(payload)} | "
             f"fetch_time={(t_fetch_end - t_fetch_start):.3f}s"
@@ -66,60 +69,72 @@ def get_endpoints():
         return payload
 
     except requests.exceptions.RequestException as e:
-
         raise APIException(f"Error de conexion: {e}")
-    
-def remove_endpoint(endpoint):
-    mac_format = endpoint.replace("%3A",":")
+
+
+def remove_endpoint(endpoint: str, api_user: str | None = None, api_pass: str | None = None):
+    mac_format = endpoint.replace("%3A", ":")
     api_fetch_time = datetime.now()
-    total_removed = 0
+
+    user = api_user or API_USER
+    pwd  = api_pass or API_PASS
+
     del_api = f"{API_URL}/{endpoint}"
     t_fetch_start = time.perf_counter()
-    job_title = f"{api_fetch_time.year}{api_fetch_time.month}{api_fetch_time.day}_{api_fetch_time.hour}{api_fetch_time.minute}_{API_USER}.log"
-    with open(f".//jobs_executed//{job_title}","a") as log: 
+
+    # Asegura carpeta de jobs
+    os.makedirs(".//jobs_executed", exist_ok=True)
+
+    job_title = f"{api_fetch_time.year}{api_fetch_time.month}{api_fetch_time.day}_{api_fetch_time.hour}{api_fetch_time.minute}_{user}.log"
+
+    with open(f".//jobs_executed//{job_title}", "a", encoding="utf-8") as log:
         try:
-            req = requests.delete(del_api,auth=(API_USER,API_PASS), verify=False,timeout=30)
+            req = requests.delete(del_api, auth=(user, pwd), verify=False, timeout=30)
 
             if req.status_code == 401:
                 raise APIException("Username or Password error (401)")
-            
+
             if req.status_code == 404:
                 log.write(f"{datetime.now().isoformat()} | WARN | {endpoint} not found \n")
-            
+
             if req.status_code == 200:
                 log.write(f"{datetime.now().isoformat()} | INFO | {endpoint} removed \n")
-                total_removed += 1 
 
             if req.status_code != 200 and req.status_code != 404:
-                    raise APIException(f"unexpected response: {req.status_code}")
+                raise APIException(f"unexpected response: {req.status_code}")
 
         except requests.exceptions.RequestException as e:
-
             raise APIException(f"Error de conexion: {e}")
-        
+
     t_fetch_end = time.perf_counter()
     exec_logger.info(
-        f"user running: {API_USER} | "
+        f"user running: {user} | "
         f"API remove endpoint at {api_fetch_time.isoformat()} | "
         f"Job {job_title} removes {mac_format} | "
         f"fetch_time={(t_fetch_end - t_fetch_start):.3f}s"
     )
-    with open(".//jobs_executed//history.log","a") as hist_log:
-        hist_log.write(f"{api_fetch_time} | User: {API_USER} | Detailed Log: {job_title} | Endpoint Removed: {mac_format} \n")
+
+    # EXACTO al formato que pediste (#4)
+    with open(".//jobs_executed//history.log", "a", encoding="utf-8") as hist_log:
+        hist_log.write(f"{api_fetch_time} | User: {user} | Detailed Log: {job_title} | Endpoint Removed: {mac_format} \n")
+
+    # Regresamos estos valores para que la GUI los imprima también
+    return api_fetch_time, user, job_title, mac_format
 
 
-def create_database_copy():
-    payload = get_endpoints()
+def create_database_copy(api_user: str | None = None, api_pass: str | None = None):
+    payload = get_endpoints(api_user=api_user, api_pass=api_pass)
     current_dt = datetime.now()
+
+    os.makedirs(".\\backup", exist_ok=True)
+
     backup_db = f"backup_{current_dt.year}{current_dt.month}{current_dt.day}_{current_dt.hour}{current_dt.minute}.json"
 
-    with open(f".\\backup\\{backup_db}","a",encoding="utf-8") as db_file:
-        json.dump(
-            payload,
-            db_file,
-            indent=4,
-            ensure_ascii=False
-        )
+    with open(f".\\backup\\{backup_db}", "w", encoding="utf-8") as db_file:
+        json.dump(payload, db_file, indent=4, ensure_ascii=False)
+
+    return backup_db
+
 
 def normalize_mac(mac: str, output: str = "plain") -> str:
     mac = mac.strip()
