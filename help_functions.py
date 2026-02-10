@@ -257,37 +257,25 @@ def normalize_mac(mac: str, output: str = "plain") -> str:
     raise ValueError("output debe ser 'plain' o 'colon' o 'ise'")
 
 
-from typing import List, Tuple
-
-def validate_macs(file_location: str) -> Tuple[bool, List[str], List[Tuple[int, str, str]]]:
+def validate_macs(file_location: str) -> Tuple[bool, List[str]]:
     """
-    Reads a .txt and validates each line as a MAC.
-    Accepts:
-      - AA:AA:BB:BB:CC:CC
-      - aaaa.bbbb.cccc
+    Lee un .txt, valida cada línea como MAC (colon o dot), y regresa:
+      (is_correct, lst_endpoint_ise)
 
-    Returns:
-      (ok, endpoints_ise, errors)
-
-    errors: list of tuples -> (line_number, raw_value, reason)
+    lst_endpoint_ise contiene MACs en formato ISE para borrar (AA%3ABB%3A...).
     """
-    endpoints: List[str] = []
-    errors: List[Tuple[int, str, str]] = []
+    is_correct = True
+    lst_endpoint: List[str] = []
 
-    with open(file_location, "r", encoding="utf-8", errors="ignore") as f:
-        for line_no, raw in enumerate(f, start=1):
-            value = raw.strip()
-
-            # skip empty lines
-            if not value:
+    with open(file_location, "r", encoding="utf-8", errors="ignore") as tmp_db:
+        for line in tmp_db:
+            line = line.strip()
+            if not line:
                 continue
 
             try:
-                endpoints.append(normalize_mac(value, "ise"))
-            except Exception as e:
-                # reason can be the exception message (safe & useful)
-                errors.append((line_no, value, str(e)))
+                lst_endpoint.append(normalize_mac(line, "ise"))
+            except Exception:
+                is_correct = False
 
-    ok = (len(errors) == 0 and len(endpoints) > 0)
-    return ok, endpoints, errors
-
+    return is_correct, lst_endpoint
