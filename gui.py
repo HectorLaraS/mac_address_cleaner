@@ -1,244 +1,381 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
+import shutil
+import threading
+import queue
+import time
 
+from help_functions import validate_macs, create_database_copy, remove_endpoint
 
-# -------------------------
-# Config de colores (similar a tu paleta)
-# -------------------------
-COL_BG_MAIN = "#788089"     # gris azulado (fondo)
-COL_PANEL   = "#6f7780"     # panel gris
-COL_LABEL_BG = "#000000"    # labels negro
-COL_LABEL_FG = "#ffffff"    # labels blanco
-COL_ENTRY_BG = "#ffffff"
-COL_ENTRY_FG = "#000000"
+# =========================
+# CONFIG
+# =========================
+RECOMMENDED_MAX = 3000
+ALLOWED_MAX = 5000
 
-COL_BTN_EXEC_BG = "#b3202a"  # rojo
+WARN_MACS = 1000
+SLEEP_BETWEEN_CALLS = 0.02
+
+UI_MAX_LOG_LINES = 2500
+DETAIL_EVERY = 1
+PROGRESS_UI_EVERY = 5
+
+# =========================
+# COLORS
+# =========================
+COL_BG_MAIN   = "#788089"
+COL_PANEL     = "#6f7780"
+COL_LABEL_BG  = "#000000"
+COL_LABEL_FG  = "#ffffff"
+COL_ENTRY_BG  = "#ffffff"
+COL_ENTRY_FG  = "#000000"
+COL_BTN_EXEC_BG = "#b3202a"
 COL_BTN_EXEC_FG = "#000000"
+COL_BTN_CLR_BG  = "#f2dc7a"
+COL_BTN_CLR_FG  = "#000000"
 
-COL_BTN_CLR_BG = "#f2dc7a"   # amarillo
-COL_BTN_CLR_FG = "#000000"
+
+def format_duration(seconds: float) -> str:
+    s = int(round(seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h}h {m}m {sec}s"
+    if m > 0:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("MAC Tool")
+        self.title("MAC Address Cleaner")
+        self.geometry("980x590")
+        self.minsize(920, 520)
         self.configure(bg=COL_BG_MAIN)
-        self.geometry("980x520")
-        self.minsize(900, 480)
 
-        # Estilo ttk (por si usas ttk widgets)
-        style = ttk.Style(self)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
+        self.valid_endpoints = []
+        self.file_valid = False
+        self.is_running = False
+        self.ui_queue = queue.Queue()
 
-        # Contenedor principal (panel redondeado no existe nativo; simulamos con frame)
+        self.max_limit_var = tk.IntVar(value=RECOMMENDED_MAX)
+
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_text_var = tk.StringVar(value="0/0")
+        self.loaded_text_var = tk.StringVar(value=f"Loaded: 0 | Limit: {RECOMMENDED_MAX}")
+
+        self.run_start_ts = None
+
+        self._build_ui()
+        self._refresh_execute_state()
+        self.after(100, self._drain_ui_queue)
+
+    # =========================
+    # UI
+    # =========================
+    def _build_ui(self):
         panel = tk.Frame(self, bg=COL_PANEL, bd=2, relief="ridge")
         panel.pack(fill="both", expand=True, padx=18, pady=18)
 
-        # Grid principal
-        panel.grid_columnconfigure(0, weight=1)
-        panel.grid_columnconfigure(1, weight=1)
-        panel.grid_columnconfigure(2, weight=1)
-        panel.grid_columnconfigure(3, weight=1)
+        panel.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        panel.grid_rowconfigure(5, weight=1)
 
-        # -------------------------
-        # Fila 0: Username / Password
-        # -------------------------
+        # Username / Password
         self._label(panel, "Username").grid(row=0, column=0, sticky="w", padx=14, pady=(14, 6))
         self.ent_user = self._entry(panel)
         self.ent_user.grid(row=0, column=1, sticky="we", padx=10, pady=(14, 6))
+        self.ent_user.bind("<KeyRelease>", lambda e: self._refresh_execute_state())
 
         self._label(panel, "Password").grid(row=0, column=2, sticky="w", padx=14, pady=(14, 6))
         self.ent_pass = self._entry(panel, show="*")
         self.ent_pass.grid(row=0, column=3, sticky="we", padx=10, pady=(14, 6))
+        self.ent_pass.bind("<KeyRelease>", lambda e: self._refresh_execute_state())
 
-        # -------------------------
-        # Fila 1: Barra MAC ADD LIST + botón cargar
-        # -------------------------
-        # Entry grande (ruta)
+        # Max MAC limit
+        limit_row = tk.Frame(panel, bg=COL_PANEL)
+        limit_row.grid(row=1, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 6))
+
+        self._label(limit_row, "Max MACs").grid(row=0, column=0, sticky="w", padx=(0, 10))
+
+        opts = [RECOMMENDED_MAX, ALLOWED_MAX]
+        self.opt_limit = tk.OptionMenu(limit_row, self.max_limit_var, *opts)
+        self.opt_limit.config(bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid")
+        self.opt_limit.grid(row=0, column=1, sticky="w")
+
+        tk.Label(
+            limit_row,
+            textvariable=self.loaded_text_var,
+            bg=COL_PANEL,
+            fg="black",
+            font=("Segoe UI", 9, "bold")
+        ).grid(row=0, column=2, sticky="w", padx=(14, 0))
+
+        # File input
         self.ent_file = self._entry(panel)
-        self.ent_file.grid(row=1, column=0, columnspan=3, sticky="we", padx=14, pady=(6, 10), ipady=3)
+        self.ent_file.grid(row=2, column=0, columnspan=3, sticky="we", padx=14, pady=(6, 10), ipady=2)
 
-        # Label "MAC ADD LIST" + botón browse (la "barra al lado")
-        right_box = tk.Frame(panel, bg=COL_PANEL)
-        right_box.grid(row=1, column=3, sticky="we", padx=10, pady=(6, 10))
-        right_box.grid_columnconfigure(0, weight=1)
-
-        # Label en negro y blanco como pediste
-        self._label(right_box, "MAC ADD LIST").grid(row=0, column=0, sticky="w", padx=(0, 8))
-
-        btn_browse = tk.Button(
-            right_box,
-            text="Browse...",
+        tk.Button(
+            panel,
+            text="Browse (.txt)",
             command=self.browse_txt,
             bg=COL_ENTRY_BG,
-            fg=COL_ENTRY_FG,
             bd=1,
             relief="solid",
-            cursor="hand2"
+            width=14
+        ).grid(row=2, column=3, padx=10, pady=(6, 10), sticky="e")
+
+        # Progress bar
+        prog_row = tk.Frame(panel, bg=COL_PANEL)
+        prog_row.grid(row=3, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 10))
+        prog_row.grid_columnconfigure(0, weight=1)
+
+        self.progress = ttk.Progressbar(
+            prog_row,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100.0,
+            variable=self.progress_var
         )
-        btn_browse.grid(row=0, column=1, sticky="e")
+        self.progress.grid(row=0, column=0, sticky="we", padx=(0, 12))
 
-        # -------------------------
-        # Fila 2: Labels de cajas grandes
-        # -------------------------
-        self._label(panel, "MAC Address to remove").grid(row=2, column=0, columnspan=2, sticky="w", padx=14, pady=(4, 6))
-        self._label(panel, "Log File").grid(row=2, column=2, columnspan=2, sticky="w", padx=14, pady=(4, 6))
+        tk.Label(
+            prog_row,
+            textvariable=self.progress_text_var,
+            bg=COL_PANEL,
+            font=("Segoe UI", 10, "bold"),
+            width=10
+        ).grid(row=0, column=1)
 
-        # -------------------------
-        # Fila 3: Cajas grandes (izq: lista MAC / der: log)
-        # -------------------------
-        panel.grid_rowconfigure(3, weight=1)
+        # Labels
+        self._label(panel, "MAC Addresses to Remove").grid(row=4, column=0, columnspan=2, sticky="w", padx=14)
+        self._label(panel, "Log Output").grid(row=4, column=2, columnspan=2, sticky="w", padx=14)
 
-        left_frame = tk.Frame(panel, bg=COL_PANEL)
-        left_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=14, pady=(0, 10))
-        left_frame.grid_rowconfigure(0, weight=1)
-        left_frame.grid_columnconfigure(0, weight=1)
+        # Text areas
+        self.txt_mac = tk.Text(panel, bg=COL_ENTRY_BG, bd=1, relief="solid")
+        self.txt_mac.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
 
-        right_frame = tk.Frame(panel, bg=COL_PANEL)
-        right_frame.grid(row=3, column=2, columnspan=2, sticky="nsew", padx=14, pady=(0, 10))
-        right_frame.grid_rowconfigure(0, weight=1)
-        right_frame.grid_columnconfigure(0, weight=1)
+        self.txt_log = tk.Text(panel, bg=COL_ENTRY_BG, bd=1, relief="solid")
+        self.txt_log.grid(row=5, column=2, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
 
-        # Text izquierda (MAC list)
-        self.txt_mac_list = tk.Text(left_frame, wrap="none", bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid")
-        self.txt_mac_list.grid(row=0, column=0, sticky="nsew")
-        self._add_scrollbars(left_frame, self.txt_mac_list)
-
-        # Text derecha (Log)
-        self.txt_log = tk.Text(right_frame, wrap="none", bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid")
-        self.txt_log.grid(row=0, column=0, sticky="nsew")
-        self._add_scrollbars(right_frame, self.txt_log)
-
-        # -------------------------
-        # Fila 4: Botones (Execute / Clear)
-        # -------------------------
+        # Buttons
         bottom = tk.Frame(panel, bg=COL_PANEL)
-        bottom.grid(row=4, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 14))
-        bottom.grid_columnconfigure(0, weight=1)
-        bottom.grid_columnconfigure(1, weight=1)
+        bottom.grid(row=6, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 14))
 
-        btn_execute = tk.Button(
+        self.btn_execute = tk.Button(
             bottom,
-            text="Execute",
-            command=self.execute,
+            text="Execute (Clear MACs)",
+            command=self.on_execute,
             bg=COL_BTN_EXEC_BG,
-            fg=COL_BTN_EXEC_FG,
-            bd=1,
-            relief="solid",
-            cursor="hand2",
-            width=16
+            width=20,
+            state="disabled"
         )
-        btn_execute.grid(row=0, column=0, sticky="w", padx=(10, 0), pady=8, ipady=6)
+        self.btn_execute.grid(row=0, column=0, padx=(10, 30), pady=8)
 
-        btn_clear = tk.Button(
+        self.btn_clear = tk.Button(
             bottom,
-            text="Clear",
+            text="Clear / Reset",
             command=self.clear_all,
             bg=COL_BTN_CLR_BG,
-            fg=COL_BTN_CLR_FG,
-            bd=1,
-            relief="solid",
-            cursor="hand2",
-            width=16
+            width=20
         )
-        btn_clear.grid(row=0, column=1, sticky="w", padx=(40, 0), pady=8, ipady=6)
+        self.btn_clear.grid(row=0, column=1, pady=8)
 
-    # -------------------------
-    # UI helpers
-    # -------------------------
-    def _label(self, parent, text: str) -> tk.Label:
-        return tk.Label(
-            parent,
-            text=text,
-            bg=COL_LABEL_BG,
-            fg=COL_LABEL_FG,
-            padx=8,
-            pady=4,
-            font=("Segoe UI", 10, "bold")
-        )
+    def _label(self, parent, text):
+        return tk.Label(parent, text=text, bg=COL_LABEL_BG, fg=COL_LABEL_FG, padx=8, pady=4)
 
-    def _entry(self, parent, show: str | None = None) -> tk.Entry:
-        return tk.Entry(
-            parent,
-            bg=COL_ENTRY_BG,
-            fg=COL_ENTRY_FG,
-            bd=1,
-            relief="solid",
-            show=show if show else ""
-        )
+    def _entry(self, parent, show=None):
+        return tk.Entry(parent, bg=COL_ENTRY_BG, bd=1, relief="solid", show=show or "")
 
-    def _add_scrollbars(self, parent: tk.Widget, text_widget: tk.Text) -> None:
-        # vertical
-        yscroll = tk.Scrollbar(parent, orient="vertical", command=text_widget.yview)
-        yscroll.grid(row=0, column=1, sticky="ns")
-        # horizontal
-        xscroll = tk.Scrollbar(parent, orient="horizontal", command=text_widget.xview)
-        xscroll.grid(row=1, column=0, sticky="we")
-        text_widget.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
-
-        parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(0, weight=1)
-
-    # -------------------------
-    # Actions
-    # -------------------------
-    def browse_txt(self) -> None:
-        path = filedialog.askopenfilename(
-            title="Select a TXT file",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")]
-        )
+    # =========================
+    # FILE LOAD + VALIDATION
+    # =========================
+    def browse_txt(self):
+        path = filedialog.askopenfilename(filetypes=[("Text files", "*.txt")])
         if not path:
             return
 
-        p = Path(path)
-        if p.suffix.lower() != ".txt":
-            messagebox.showerror("Invalid file", "Debe de ser un archivo de texto (.txt).")
+        ok, endpoints, errors = validate_macs(path)
+
+        if not ok:
+            MAX_SHOW = 8
+            preview = errors[:MAX_SHOW]
+
+            lines = [
+                f"Line {ln}: '{val}' -> {reason}"
+                for ln, val, reason in preview
+            ]
+
+            more = ""
+            if len(errors) > MAX_SHOW:
+                more = f"\n(+{len(errors) - MAX_SHOW} more errors not shown)"
+
+            messagebox.showerror(
+                "Validation Failed",
+                "The file contains invalid MAC addresses.\n\n"
+                "Fix the following lines:\n\n"
+                + "\n".join(lines)
+                + more
+            )
             return
+
+        count = len(endpoints)
+        chosen_limit = int(self.max_limit_var.get())
+
+        if count > chosen_limit:
+            messagebox.showerror(
+                "Too Many MACs",
+                f"This file contains {count} MACs.\n"
+                f"Selected limit: {chosen_limit}."
+            )
+            return
+
+        if chosen_limit == ALLOWED_MAX:
+            if not messagebox.askyesno(
+                "Warning",
+                "You selected the 5000 limit.\nThis may take longer.\n\nContinue?"
+            ):
+                return
+
+        if count > WARN_MACS:
+            if not messagebox.askyesno(
+                "Warning",
+                f"This run will process {count} MACs.\n\nContinue?"
+            ):
+                return
+
+        dest_dir = Path("./input_files")
+        dest_dir.mkdir(exist_ok=True)
+        dest = dest_dir / Path(path).name
+        shutil.copy2(path, dest)
+
+        self.valid_endpoints = endpoints
+        self.file_valid = True
+
+        self.ent_file.delete(0, tk.END)
+        self.ent_file.insert(0, str(dest))
+
+        self.txt_mac.delete("1.0", tk.END)
+        for e in endpoints:
+            self.txt_mac.insert(tk.END, e.replace("%3A", ":") + "\n")
+
+        self.loaded_text_var.set(f"Loaded: {count} | Limit: {chosen_limit}")
+        self._set_progress(0, count)
+        self.log(f"File loaded: {dest.name} | MACs={count}")
+
+        self._refresh_execute_state()
+
+    # =========================
+    # EXECUTION
+    # =========================
+    def on_execute(self):
+        if not messagebox.askyesno("Confirm", "Are you sure you want to clear these MACs?"):
+            return
+
+        self.is_running = True
+        self.run_start_ts = time.perf_counter()
+        self._refresh_execute_state()
+        self.log("Starting job...")
+
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def _worker(self):
+        removed = 0
+        not_found = 0
+        total = len(self.valid_endpoints)
 
         try:
-            content = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            # fallback típico en Windows
-            content = p.read_text(encoding="latin-1")
+            backup = create_database_copy()
+            self.ui_queue.put(("log", f"Backup created: {backup}"))
+
+            for i, ep in enumerate(self.valid_endpoints, start=1):
+                api_time, api_user, job, mac, status = remove_endpoint(ep)
+
+                if status == 200:
+                    removed += 1
+                    result = "REMOVED"
+                else:
+                    not_found += 1
+                    result = "NOT FOUND"
+
+                self.ui_queue.put(("log", f"[{i}/{total}] {mac} -> {result}"))
+                percent = (i / total) * 100.0
+                self.ui_queue.put(("progress", (percent, i, total)))
+
+                time.sleep(SLEEP_BETWEEN_CALLS)
+
+            self.ui_queue.put(("log", f"DONE: Removed={removed} | NotFound={not_found}"))
+
         except Exception as e:
-            messagebox.showerror("Error", f"No se pudo leer el archivo.\n{e}")
-            return
+            self.ui_queue.put(("log", f"ERROR: {e}"))
+        finally:
+            elapsed = time.perf_counter() - self.run_start_ts
+            self.ui_queue.put(("elapsed", elapsed))
+            self.ui_queue.put(("done", None))
 
-        # Coloca ruta en la barra y carga contenido en el área izquierda
-        self.ent_file.delete(0, tk.END)
-        self.ent_file.insert(0, str(p))
+    # =========================
+    # UI QUEUE
+    # =========================
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                kind, payload = self.ui_queue.get_nowait()
 
-        self.txt_mac_list.delete("1.0", tk.END)
-        self.txt_mac_list.insert("1.0", content)
+                if kind == "log":
+                    self.log(payload)
+                elif kind == "progress":
+                    p, i, t = payload
+                    self.progress_var.set(p)
+                    self.progress_text_var.set(f"{i}/{t}")
+                elif kind == "elapsed":
+                    self.log(f"Total time: {format_duration(payload)}")
+                elif kind == "done":
+                    self.is_running = False
+                    self.btn_execute.config(state="disabled")
+                    self.log("Job finished. Click Clear / Reset to start again.")
+        except queue.Empty:
+            pass
 
-        self.log(f"Archivo cargado: {p.name} ({len(content)} chars)")
+        self.after(100, self._drain_ui_queue)
 
-    def clear_all(self) -> None:
+    # =========================
+    # HELPERS
+    # =========================
+    def _refresh_execute_state(self):
+        ready = self.file_valid and not self.is_running
+        self.btn_execute.config(state="normal" if ready else "disabled")
+
+    def _set_progress(self, i: int, total: int):
+        if total > 0:
+            self.progress_var.set((i / total) * 100.0)
+            self.progress_text_var.set(f"{i}/{total}")
+
+    def clear_all(self):
         self.ent_user.delete(0, tk.END)
         self.ent_pass.delete(0, tk.END)
         self.ent_file.delete(0, tk.END)
-        self.txt_mac_list.delete("1.0", tk.END)
+        self.txt_mac.delete("1.0", tk.END)
         self.txt_log.delete("1.0", tk.END)
 
-    def execute(self) -> None:
-        # Aquí conectas tu lógica real (MSSQL, remoción, etc.)
-        user = self.ent_user.get().strip()
-        file_path = self.ent_file.get().strip()
-        macs_raw = self.txt_mac_list.get("1.0", tk.END).strip()
+        self.valid_endpoints.clear()
+        self.file_valid = False
+        self.is_running = False
+        self.run_start_ts = None
 
-        self.log("---- EXECUTE ----")
-        self.log(f"Username: {user if user else '(vacío)'}")
-        self.log(f"File: {file_path if file_path else '(sin archivo)'}")
-        self.log(f"MAC ADD LIST chars: {len(macs_raw)}")
-        self.log("Aquí iría la lógica de procesamiento...")
+        limit = int(self.max_limit_var.get())
+        self.loaded_text_var.set(f"Loaded: 0 | Limit: {limit}")
+        self._set_progress(0, 0)
+        self._refresh_execute_state()
 
-    def log(self, msg: str) -> None:
+    def log(self, msg: str):
         self.txt_log.insert(tk.END, msg + "\n")
+
+        lines = int(self.txt_log.index("end-1c").split(".")[0])
+        if lines > UI_MAX_LOG_LINES:
+            self.txt_log.delete("1.0", f"{lines - UI_MAX_LOG_LINES}.0")
+
         self.txt_log.see(tk.END)
 
 
