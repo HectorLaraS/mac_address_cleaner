@@ -18,8 +18,9 @@ WARN_MACS = 1000
 SLEEP_BETWEEN_CALLS = 0.02
 
 UI_MAX_LOG_LINES = 2500
-DETAIL_EVERY = 1                 # 1 = cada MAC; 5 = cada 5
-PROGRESS_UI_EVERY = 5            # actualiza barra/labels cada N MACs
+DETAIL_EVERY = 1                 # 1 = every MAC; 5 = every 5 MACs
+PROGRESS_UI_EVERY = 5            # update progress UI every N MACs
+
 
 # =========================
 # COLORS
@@ -34,6 +35,19 @@ COL_BTN_EXEC_BG = "#b3202a"
 COL_BTN_EXEC_FG = "#000000"
 COL_BTN_CLR_BG  = "#f2dc7a"
 COL_BTN_CLR_FG  = "#000000"
+
+
+def format_duration(seconds: float) -> str:
+    # friendly duration
+    s = int(round(seconds))
+    h = s // 3600
+    m = (s % 3600) // 60
+    sec = s % 60
+    if h > 0:
+        return f"{h}h {m}m {sec}s"
+    if m > 0:
+        return f"{m}m {sec}s"
+    return f"{sec}s"
 
 
 class App(tk.Tk):
@@ -51,10 +65,13 @@ class App(tk.Tk):
 
         self.max_limit_var = tk.IntVar(value=RECOMMENDED_MAX)
 
-        # Progreso (tk vars)
+        # progress vars
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0/0")
-        self.loaded_text_var = tk.StringVar(value="Loaded: 0 | Limit: 3000")
+        self.loaded_text_var = tk.StringVar(value=f"Loaded: 0 | Limit: {RECOMMENDED_MAX}")
+
+        # runtime
+        self.run_start_ts = None  # type: float | None
 
         self._build_ui()
         self._refresh_execute_state()
@@ -144,8 +161,8 @@ class App(tk.Tk):
         self.progress_counter.grid(row=0, column=1, sticky="e")
 
         # Row 4: Labels
-        self._label(panel, "MAC Address to remove").grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 6))
-        self._label(panel, "Log File").grid(row=4, column=2, columnspan=2, sticky="w", padx=14, pady=(2, 6))
+        self._label(panel, "MAC Addresses to Remove").grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 6))
+        self._label(panel, "Log Output").grid(row=4, column=2, columnspan=2, sticky="w", padx=14, pady=(2, 6))
 
         # Row 5: Text areas
         self.txt_mac = tk.Text(panel, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
@@ -165,7 +182,7 @@ class App(tk.Tk):
 
         self.btn_execute = tk.Button(
             bottom,
-            text="Execute (Clear MAC)",
+            text="Execute (Clear MACs)",
             command=self.on_execute,
             bg=COL_BTN_EXEC_BG, fg=COL_BTN_EXEC_FG,
             bd=1, relief="solid",
@@ -177,7 +194,7 @@ class App(tk.Tk):
 
         self.btn_clear = tk.Button(
             bottom,
-            text="Clear",
+            text="Clear / Reset",
             command=self.clear_all,
             bg=COL_BTN_CLR_BG, fg=COL_BTN_CLR_FG,
             bd=1, relief="solid",
@@ -204,31 +221,31 @@ class App(tk.Tk):
         count = len(endpoints)
 
         if not ok or count == 0:
-            messagebox.showerror("Validation failed", "El archivo contiene MACs inválidas o está vacío.")
+            messagebox.showerror("Validation Failed", "The file contains invalid MAC addresses or is empty.")
             return
 
         chosen_limit = int(self.max_limit_var.get())
 
         if count > chosen_limit:
             messagebox.showerror(
-                "Too many MACs",
-                f"Este archivo contiene {count} MACs.\n"
-                f"Tu límite seleccionado es {chosen_limit}.\n\n"
-                f"Reduce el archivo a {chosen_limit} o menos, o cambia el límite."
+                "Too Many MACs",
+                f"This file contains {count} MACs.\n"
+                f"Your selected limit is {chosen_limit}.\n\n"
+                f"Reduce the file to {chosen_limit} or less, or change the limit."
             )
             return
 
         if chosen_limit == ALLOWED_MAX:
             if not messagebox.askyesno(
-                "Advertencia",
-                "Seleccionaste límite 5000.\nPuede tardar más y el API puede rate-limitar.\n\n¿Continuar?"
+                "Warning",
+                "You selected the 5000 limit.\nThis may take longer and ISE may rate-limit the API.\n\nContinue?"
             ):
                 return
 
         if count > WARN_MACS:
             if not messagebox.askyesno(
-                "Advertencia",
-                f"Se procesarán {count} MACs.\nEsto puede tardar varios minutos.\n\n¿Continuar?"
+                "Warning",
+                f"This run will process {count} MACs.\nIt may take several minutes.\n\nContinue?"
             ):
                 return
 
@@ -251,19 +268,20 @@ class App(tk.Tk):
         self.loaded_text_var.set(f"Loaded: {count} | Limit: {chosen_limit}")
         self._set_progress(0, count)
 
-        self.log(f"✅ Archivo cargado: {dest.name} | MACs={count} | Limit={chosen_limit}")
+        self.log(f"✅ File loaded: {dest.name} | MACs={count} | Limit={chosen_limit}")
         self._refresh_execute_state()
 
     # =========================
     # EXECUTION
     # =========================
     def on_execute(self):
-        if not messagebox.askyesno("Confirmar", "¿Seguro que deseas borrar las MACs?"):
+        if not messagebox.askyesno("Confirm", "Are you sure you want to clear these MACs?"):
             return
 
         self.is_running = True
+        self.run_start_ts = time.perf_counter()
         self._refresh_execute_state()
-        self.log("▶ Iniciando proceso...")
+        self.log("▶ Starting job...")
 
         t = threading.Thread(target=self._worker, daemon=True)
         t.start()
@@ -278,7 +296,7 @@ class App(tk.Tk):
 
         try:
             backup = create_database_copy(api_user=user, api_pass=pwd)
-            self.ui_queue.put(("log", f"📦 Backup creado: {backup}"))
+            self.ui_queue.put(("log", f"📦 Backup created: {backup}"))
 
             for i, ep in enumerate(self.valid_endpoints, start=1):
                 api_time, api_user, job, mac, status = remove_endpoint(ep, api_user=user, api_pass=pwd)
@@ -292,26 +310,31 @@ class App(tk.Tk):
                 else:
                     result = f"STATUS {status}"
 
-                # Detalle por MAC
+                # per-MAC detail
                 if DETAIL_EVERY == 1 or (i % DETAIL_EVERY == 0) or (i == total):
-                    self.ui_queue.put(("log", f"[{i}/{total}] {mac} -> {result} | Log: {job}"))
+                    self.ui_queue.put(("log", f"[{i}/{total}] {mac} -> {result} | Job Log: {job}"))
 
-                # Progreso (UI) cada N
+                # progress UI
                 if i % PROGRESS_UI_EVERY == 0 or i == total:
                     percent = (i / total) * 100.0
                     self.ui_queue.put(("progress", (percent, i, total)))
 
-                # Resumen cada 50
+                # periodic summary
                 if i % 50 == 0 or i == total:
-                    self.ui_queue.put(("log", f"Progreso: {i}/{total} | Removed={removed} | NotFound={not_found}"))
+                    self.ui_queue.put(("log", f"Progress: {i}/{total} | Removed={removed} | NotFound={not_found}"))
 
                 time.sleep(SLEEP_BETWEEN_CALLS)
 
-            self.ui_queue.put(("log", f"✅ FINAL: Removed={removed} | NotFound={not_found} | Total={total}"))
+            self.ui_queue.put(("log", f"✅ DONE: Removed={removed} | NotFound={not_found} | Total={total}"))
 
         except Exception as e:
             self.ui_queue.put(("log", f"❌ ERROR: {e}"))
         finally:
+            # elapsed time
+            end_ts = time.perf_counter()
+            start_ts = self.run_start_ts or end_ts
+            elapsed = end_ts - start_ts
+            self.ui_queue.put(("elapsed", elapsed))
             self.ui_queue.put(("done", None))
 
     # =========================
@@ -321,16 +344,24 @@ class App(tk.Tk):
         try:
             while True:
                 kind, payload = self.ui_queue.get_nowait()
+
                 if kind == "log":
                     self.log(payload)
+
                 elif kind == "progress":
                     percent, i, total = payload
                     self.progress_var.set(percent)
                     self.progress_text_var.set(f"{i}/{total}")
+
+                elif kind == "elapsed":
+                    elapsed = float(payload)
+                    self.log(f"⏱ Total time: {format_duration(elapsed)} ({elapsed:.2f}s)")
+
                 elif kind == "done":
                     self.is_running = False
+                    # keep disabled until Clear/Reset
                     self.btn_execute.config(state="disabled")
-                    self.log("✅ Proceso terminado. Usa 'Clear' para reiniciar.")
+                    self.log("Job finished. Click 'Clear / Reset' to start a new run.")
         except queue.Empty:
             pass
 
@@ -366,6 +397,7 @@ class App(tk.Tk):
         self.valid_endpoints.clear()
         self.file_valid = False
         self.is_running = False
+        self.run_start_ts = None
 
         chosen_limit = int(self.max_limit_var.get())
         self.loaded_text_var.set(f"Loaded: 0 | Limit: {chosen_limit}")
@@ -376,7 +408,7 @@ class App(tk.Tk):
     def log(self, msg: str):
         self.txt_log.insert(tk.END, msg + "\n")
 
-        # Cap de líneas para rendimiento
+        # cap lines for performance
         lines = int(self.txt_log.index("end-1c").split(".")[0])
         if lines > UI_MAX_LOG_LINES:
             self.txt_log.delete("1.0", f"{lines - UI_MAX_LOG_LINES}.0")
