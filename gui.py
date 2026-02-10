@@ -5,6 +5,9 @@ import shutil
 import threading
 import queue
 import time
+import os
+import csv
+from datetime import datetime
 
 from help_functions import validate_macs, create_database_copy, remove_endpoint
 
@@ -13,13 +16,18 @@ from help_functions import validate_macs, create_database_copy, remove_endpoint
 # =========================
 RECOMMENDED_MAX = 3000
 ALLOWED_MAX = 5000
-
 WARN_MACS = 1000
-SLEEP_BETWEEN_CALLS = 0.02
 
 UI_MAX_LOG_LINES = 2500
-DETAIL_EVERY = 1
-PROGRESS_UI_EVERY = 5
+DETAIL_EVERY = 1               # 1 = every MAC; 5 = every 5
+PROGRESS_UI_EVERY = 5          # update progress UI every N MACs
+
+# Rate limit presets (sleep between calls)
+RATE_PROFILES = {
+    "Fast": 0.00,
+    "Balanced": 0.02,
+    "Safe": 0.08,
+}
 
 # =========================
 # COLORS
@@ -34,10 +42,12 @@ COL_BTN_EXEC_BG = "#b3202a"
 COL_BTN_EXEC_FG = "#000000"
 COL_BTN_CLR_BG  = "#f2dc7a"
 COL_BTN_CLR_FG  = "#000000"
+COL_BTN_CANCEL_BG = "#e0e0e0"
+COL_BTN_CANCEL_FG = "#000000"
 
 
 def format_duration(seconds: float) -> str:
-    s = int(round(seconds))
+    s = max(0, int(round(seconds)))
     h = s // 3600
     m = (s % 3600) // 60
     sec = s % 60
@@ -48,26 +58,58 @@ def format_duration(seconds: float) -> str:
     return f"{sec}s"
 
 
+def now_stamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def safe_open_folder(path: str) -> None:
+    try:
+        os.startfile(os.path.abspath(path))  # Windows
+    except Exception:
+        # fallback: try explorer
+        try:
+            os.system(f'explorer "{os.path.abspath(path)}"')
+        except Exception:
+            pass
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MAC Address Cleaner")
-        self.geometry("980x590")
-        self.minsize(920, 520)
+        self.geometry("1020x640")
+        self.minsize(940, 560)
         self.configure(bg=COL_BG_MAIN)
 
-        self.valid_endpoints = []
+        # State
+        self.valid_endpoints: list[str] = []
         self.file_valid = False
         self.is_running = False
         self.ui_queue = queue.Queue()
+        self.cancel_event = threading.Event()
 
+        # Limits + options
         self.max_limit_var = tk.IntVar(value=RECOMMENDED_MAX)
+        self.unique_only_var = tk.BooleanVar(value=True)
+        self.rate_profile_var = tk.StringVar(value="Balanced")
 
+        # Progress vars
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0/0")
+        self.eta_text_var = tk.StringVar(value="ETA: --")
         self.loaded_text_var = tk.StringVar(value=f"Loaded: 0 | Limit: {RECOMMENDED_MAX}")
 
-        self.run_start_ts = None
+        # Runtime
+        self.run_start_ts: float | None = None
+
+        # Report paths (set per run)
+        self.report_dir = Path("./reports")
+        self.report_dir.mkdir(exist_ok=True)
+        self.last_removed_report: Path | None = None
+        self.last_summary_report: Path | None = None
+
+        # In-memory results per run
+        self.run_results: list[dict] = []
 
         self._build_ui()
         self._refresh_execute_state()
@@ -81,9 +123,9 @@ class App(tk.Tk):
         panel.pack(fill="both", expand=True, padx=18, pady=18)
 
         panel.grid_columnconfigure((0, 1, 2, 3), weight=1)
-        panel.grid_rowconfigure(5, weight=1)
+        panel.grid_rowconfigure(6, weight=1)
 
-        # Username / Password
+        # Row 0: Username / Password
         self._label(panel, "Username").grid(row=0, column=0, sticky="w", padx=14, pady=(14, 6))
         self.ent_user = self._entry(panel)
         self.ent_user.grid(row=0, column=1, sticky="we", padx=10, pady=(14, 6))
@@ -94,26 +136,40 @@ class App(tk.Tk):
         self.ent_pass.grid(row=0, column=3, sticky="we", padx=10, pady=(14, 6))
         self.ent_pass.bind("<KeyRelease>", lambda e: self._refresh_execute_state())
 
-        # Max MAC limit
-        limit_row = tk.Frame(panel, bg=COL_PANEL)
-        limit_row.grid(row=1, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 6))
+        # Row 1: Options (limit, unique, rate profile)
+        opt_row = tk.Frame(panel, bg=COL_PANEL)
+        opt_row.grid(row=1, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 8))
+        opt_row.grid_columnconfigure(6, weight=1)
 
-        self._label(limit_row, "Max MACs").grid(row=0, column=0, sticky="w", padx=(0, 10))
-
+        self._label(opt_row, "Max MACs").grid(row=0, column=0, sticky="w", padx=(0, 10))
         opts = [RECOMMENDED_MAX, ALLOWED_MAX]
-        self.opt_limit = tk.OptionMenu(limit_row, self.max_limit_var, *opts)
-        self.opt_limit.config(bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid")
+        self.opt_limit = tk.OptionMenu(opt_row, self.max_limit_var, *opts)
+        self.opt_limit.config(bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", highlightthickness=0)
         self.opt_limit.grid(row=0, column=1, sticky="w")
 
+        tk.Checkbutton(
+            opt_row,
+            text="Unique only",
+            variable=self.unique_only_var,
+            bg=COL_PANEL,
+            fg="black",
+            activebackground=COL_PANEL
+        ).grid(row=0, column=2, sticky="w", padx=(16, 0))
+
+        self._label(opt_row, "Rate").grid(row=0, column=3, sticky="w", padx=(16, 10))
+        self.opt_rate = tk.OptionMenu(opt_row, self.rate_profile_var, *RATE_PROFILES.keys())
+        self.opt_rate.config(bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", highlightthickness=0)
+        self.opt_rate.grid(row=0, column=4, sticky="w")
+
         tk.Label(
-            limit_row,
+            opt_row,
             textvariable=self.loaded_text_var,
             bg=COL_PANEL,
             fg="black",
             font=("Segoe UI", 9, "bold")
-        ).grid(row=0, column=2, sticky="w", padx=(14, 0))
+        ).grid(row=0, column=6, sticky="w", padx=(16, 0))
 
-        # File input
+        # Row 2: File bar + Browse
         self.ent_file = self._entry(panel)
         self.ent_file.grid(row=2, column=0, columnspan=3, sticky="we", padx=14, pady=(6, 10), ipady=2)
 
@@ -121,73 +177,110 @@ class App(tk.Tk):
             panel,
             text="Browse (.txt)",
             command=self.browse_txt,
-            bg=COL_ENTRY_BG,
-            bd=1,
-            relief="solid",
+            bg=COL_ENTRY_BG, fg=COL_ENTRY_FG,
+            bd=1, relief="solid",
+            cursor="hand2",
             width=14
         ).grid(row=2, column=3, padx=10, pady=(6, 10), sticky="e")
 
-        # Progress bar
+        # Row 3: Progress bar + counter + ETA
         prog_row = tk.Frame(panel, bg=COL_PANEL)
         prog_row.grid(row=3, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 10))
         prog_row.grid_columnconfigure(0, weight=1)
 
         self.progress = ttk.Progressbar(
-            prog_row,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100.0,
-            variable=self.progress_var
+            prog_row, orient="horizontal", mode="determinate",
+            maximum=100.0, variable=self.progress_var
         )
         self.progress.grid(row=0, column=0, sticky="we", padx=(0, 12))
 
         tk.Label(
-            prog_row,
-            textvariable=self.progress_text_var,
-            bg=COL_PANEL,
-            font=("Segoe UI", 10, "bold"),
-            width=10
-        ).grid(row=0, column=1)
+            prog_row, textvariable=self.progress_text_var,
+            bg=COL_PANEL, fg="black",
+            font=("Segoe UI", 10, "bold"), width=10
+        ).grid(row=0, column=1, sticky="e")
 
-        # Labels
-        self._label(panel, "MAC Addresses to Remove").grid(row=4, column=0, columnspan=2, sticky="w", padx=14)
-        self._label(panel, "Log Output").grid(row=4, column=2, columnspan=2, sticky="w", padx=14)
+        tk.Label(
+            prog_row, textvariable=self.eta_text_var,
+            bg=COL_PANEL, fg="black",
+            font=("Segoe UI", 10), width=16
+        ).grid(row=0, column=2, sticky="e", padx=(12, 0))
 
-        # Text areas
-        self.txt_mac = tk.Text(panel, bg=COL_ENTRY_BG, bd=1, relief="solid")
+        # Row 4: Labels
+        self._label(panel, "MAC Addresses to Remove").grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 6))
+        self._label(panel, "Log Output").grid(row=4, column=2, columnspan=2, sticky="w", padx=14, pady=(2, 6))
+
+        # Row 5-6: Text areas
+        self.txt_mac = tk.Text(panel, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
         self.txt_mac.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
 
-        self.txt_log = tk.Text(panel, bg=COL_ENTRY_BG, bd=1, relief="solid")
+        self.txt_log = tk.Text(panel, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
         self.txt_log.grid(row=5, column=2, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
 
-        # Buttons
+        panel.grid_rowconfigure(5, weight=1)
+
+        # Row 7: Bottom buttons
         bottom = tk.Frame(panel, bg=COL_PANEL)
-        bottom.grid(row=6, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 14))
+        bottom.grid(row=7, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 14))
+        bottom.grid_columnconfigure((0, 1, 2, 3), weight=1)
+
+        btn_w = 20
+        btn_ipady = 6
 
         self.btn_execute = tk.Button(
-            bottom,
-            text="Execute (Clear MACs)",
+            bottom, text="Execute (Clear MACs)",
             command=self.on_execute,
-            bg=COL_BTN_EXEC_BG,
-            width=20,
-            state="disabled"
+            bg=COL_BTN_EXEC_BG, fg=COL_BTN_EXEC_FG,
+            bd=1, relief="solid", cursor="hand2",
+            width=btn_w, state="disabled"
         )
-        self.btn_execute.grid(row=0, column=0, padx=(10, 30), pady=8)
+        self.btn_execute.grid(row=0, column=0, sticky="w", padx=(10, 10), pady=8, ipady=btn_ipady)
 
-        self.btn_clear = tk.Button(
-            bottom,
-            text="Clear / Reset",
-            command=self.clear_all,
-            bg=COL_BTN_CLR_BG,
-            width=20
+        self.btn_cancel = tk.Button(
+            bottom, text="Cancel",
+            command=self.on_cancel,
+            bg=COL_BTN_CANCEL_BG, fg=COL_BTN_CANCEL_FG,
+            bd=1, relief="solid", cursor="hand2",
+            width=btn_w, state="disabled"
         )
-        self.btn_clear.grid(row=0, column=1, pady=8)
+        self.btn_cancel.grid(row=0, column=1, sticky="w", padx=(10, 10), pady=8, ipady=btn_ipady)
+
+        self.btn_save_removed = tk.Button(
+            bottom, text="Save Removed MACs...",
+            command=self.save_removed_macs,
+            bg=COL_ENTRY_BG, fg=COL_ENTRY_FG,
+            bd=1, relief="solid", cursor="hand2",
+            width=btn_w, state="disabled"
+        )
+        self.btn_save_removed.grid(row=0, column=2, sticky="w", padx=(10, 10), pady=8, ipady=btn_ipady)
+
+        self.btn_open_reports = tk.Button(
+            bottom, text="Open Reports Folder",
+            command=self.open_reports_folder,
+            bg=COL_ENTRY_BG, fg=COL_ENTRY_FG,
+            bd=1, relief="solid", cursor="hand2",
+            width=btn_w
+        )
+        self.btn_open_reports.grid(row=0, column=3, sticky="w", padx=(10, 0), pady=8, ipady=btn_ipady)
+
+        # Clear button below (keeps your "must reset to run again" requirement)
+        bottom2 = tk.Frame(panel, bg=COL_PANEL)
+        bottom2.grid(row=8, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 14))
+        self.btn_clear = tk.Button(
+            bottom2, text="Clear / Reset",
+            command=self.clear_all,
+            bg=COL_BTN_CLR_BG, fg=COL_BTN_CLR_FG,
+            bd=1, relief="solid", cursor="hand2",
+            width=btn_w
+        )
+        self.btn_clear.pack(side="left", padx=(10, 0), pady=6, ipady=btn_ipady)
 
     def _label(self, parent, text):
-        return tk.Label(parent, text=text, bg=COL_LABEL_BG, fg=COL_LABEL_FG, padx=8, pady=4)
+        return tk.Label(parent, text=text, bg=COL_LABEL_BG, fg=COL_LABEL_FG,
+                        padx=8, pady=4, font=("Segoe UI", 10, "bold"))
 
     def _entry(self, parent, show=None):
-        return tk.Entry(parent, bg=COL_ENTRY_BG, bd=1, relief="solid", show=show or "")
+        return tk.Entry(parent, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", show=show or "")
 
     # =========================
     # FILE LOAD + VALIDATION
@@ -200,26 +293,21 @@ class App(tk.Tk):
         ok, endpoints, errors = validate_macs(path)
 
         if not ok:
-            MAX_SHOW = 8
-            preview = errors[:MAX_SHOW]
-
-            lines = [
-                f"Line {ln}: '{val}' -> {reason}"
-                for ln, val, reason in preview
-            ]
-
-            more = ""
-            if len(errors) > MAX_SHOW:
-                more = f"\n(+{len(errors) - MAX_SHOW} more errors not shown)"
-
-            messagebox.showerror(
-                "Validation Failed",
-                "The file contains invalid MAC addresses.\n\n"
-                "Fix the following lines:\n\n"
-                + "\n".join(lines)
-                + more
-            )
+            self._show_validation_errors(errors)
             return
+
+        # Deduplicate if enabled (preserve order)
+        if self.unique_only_var.get():
+            seen = set()
+            unique = []
+            for ep in endpoints:
+                if ep not in seen:
+                    seen.add(ep)
+                    unique.append(ep)
+            skipped = len(endpoints) - len(unique)
+            endpoints = unique
+        else:
+            skipped = 0
 
         count = len(endpoints)
         chosen_limit = int(self.max_limit_var.get())
@@ -227,25 +315,27 @@ class App(tk.Tk):
         if count > chosen_limit:
             messagebox.showerror(
                 "Too Many MACs",
-                f"This file contains {count} MACs.\n"
-                f"Selected limit: {chosen_limit}."
+                f"This file contains {count} valid MACs.\n"
+                f"Selected limit: {chosen_limit}.\n\n"
+                f"Reduce the file or change the limit."
             )
             return
 
         if chosen_limit == ALLOWED_MAX:
             if not messagebox.askyesno(
                 "Warning",
-                "You selected the 5000 limit.\nThis may take longer.\n\nContinue?"
+                "You selected the 5000 limit.\nThis may take longer and ISE may rate-limit.\n\nContinue?"
             ):
                 return
 
         if count > WARN_MACS:
             if not messagebox.askyesno(
                 "Warning",
-                f"This run will process {count} MACs.\n\nContinue?"
+                f"This run will process {count} MACs.\nIt may take several minutes.\n\nContinue?"
             ):
                 return
 
+        # Copy file into ./input_files
         dest_dir = Path("./input_files")
         dest_dir.mkdir(exist_ok=True)
         dest = dest_dir / Path(path).name
@@ -263,9 +353,42 @@ class App(tk.Tk):
 
         self.loaded_text_var.set(f"Loaded: {count} | Limit: {chosen_limit}")
         self._set_progress(0, count)
-        self.log(f"File loaded: {dest.name} | MACs={count}")
+        self.eta_text_var.set("ETA: --")
 
+        self.log(f"✅ File loaded: {dest.name} | MACs={count} | UniqueOnly={self.unique_only_var.get()}")
+        if skipped:
+            self.log(f"ℹ️ Duplicates removed: {skipped}")
+
+        # Save buttons disabled until run ends
+        self.btn_save_removed.config(state="disabled")
         self._refresh_execute_state()
+
+    def _show_validation_errors(self, errors):
+        MAX_SHOW = 10
+        preview = errors[:MAX_SHOW]
+        lines = [f"Line {ln}: '{val}' -> {reason}" for ln, val, reason in preview]
+        more = f"\n(+{len(errors) - MAX_SHOW} more)" if len(errors) > MAX_SHOW else ""
+
+        messagebox.showerror(
+            "Validation Failed",
+            "The file contains invalid MAC addresses.\n\n"
+            "Fix these lines and try again:\n\n" +
+            "\n".join(lines) + more
+        )
+
+        # Also log the summary
+        self.log(f"❌ Validation failed: {len(errors)} invalid line(s). Showing first {min(len(errors), MAX_SHOW)}:")
+        for ln, val, reason in preview:
+            self.log(f"  - Line {ln}: {val} ({reason})")
+
+        # Optional: offer to export invalid lines report
+        if messagebox.askyesno("Export Errors?", "Do you want to export an invalid MACs report to ./reports?"):
+            stamp = now_stamp()
+            out = self.report_dir / f"invalid_macs_{stamp}.txt"
+            with open(out, "w", encoding="utf-8") as f:
+                for ln, val, reason in errors:
+                    f.write(f"Line {ln}: {val} -> {reason}\n")
+            self.log(f"📝 Invalid MACs report saved: {out}")
 
     # =========================
     # EXECUTION
@@ -275,45 +398,177 @@ class App(tk.Tk):
             return
 
         self.is_running = True
+        self.cancel_event.clear()
+        self.run_results = []
+
         self.run_start_ts = time.perf_counter()
         self._refresh_execute_state()
-        self.log("Starting job...")
+        self.btn_cancel.config(state="normal")
+        self.btn_save_removed.config(state="disabled")
+
+        self.log("▶ Job started...")
+        self.log(f"Rate profile: {self.rate_profile_var.get()} (sleep={RATE_PROFILES[self.rate_profile_var.get()]}s)")
 
         threading.Thread(target=self._worker, daemon=True).start()
 
+    def on_cancel(self):
+        if not self.is_running:
+            return
+        if messagebox.askyesno("Cancel", "Cancel the current run? A partial report will be generated."):
+            self.cancel_event.set()
+            self.btn_cancel.config(state="disabled")
+            self.log("⛔ Cancel requested...")
+
     def _worker(self):
+        user = self.ent_user.get().strip()
+        pwd = self.ent_pass.get().strip()
+
         removed = 0
         not_found = 0
+        errors_count = 0
         total = len(self.valid_endpoints)
 
+        sleep_s = RATE_PROFILES.get(self.rate_profile_var.get(), 0.02)
+        t_loop_start = time.perf_counter()
+
+        # Prepare report files for this run
+        stamp = now_stamp()
+        removed_report = self.report_dir / f"removed_{stamp}.txt"
+        summary_report = self.report_dir / f"summary_{stamp}.csv"
+        self.last_removed_report = removed_report
+        self.last_summary_report = summary_report
+
         try:
-            backup = create_database_copy()
-            self.ui_queue.put(("log", f"Backup created: {backup}"))
+            # Backup (uses GUI creds)
+            backup = create_database_copy(api_user=user, api_pass=pwd)
+            self.ui_queue.put(("log", f"📦 Backup created: {backup}"))
 
             for i, ep in enumerate(self.valid_endpoints, start=1):
-                api_time, api_user, job, mac, status = remove_endpoint(ep)
+                if self.cancel_event.is_set():
+                    self.ui_queue.put(("log", "⛔ Run cancelled by user. Generating partial reports..."))
+                    break
 
-                if status == 200:
-                    removed += 1
-                    result = "REMOVED"
-                else:
-                    not_found += 1
-                    result = "NOT FOUND"
+                try:
+                    api_time, api_user_used, job, mac, status = remove_endpoint(ep, api_user=user, api_pass=pwd)
 
-                self.ui_queue.put(("log", f"[{i}/{total}] {mac} -> {result}"))
-                percent = (i / total) * 100.0
-                self.ui_queue.put(("progress", (percent, i, total)))
+                    if status == 200:
+                        removed += 1
+                        result = "REMOVED"
+                    elif status == 404:
+                        not_found += 1
+                        result = "NOT_FOUND"
+                    else:
+                        errors_count += 1
+                        result = f"STATUS_{status}"
 
-                time.sleep(SLEEP_BETWEEN_CALLS)
+                    self.run_results.append({
+                        "timestamp": str(api_time),
+                        "mac": mac,
+                        "result": result,
+                        "job_log": job,
+                        "user": api_user_used,
+                        "status": status,
+                    })
 
-            self.ui_queue.put(("log", f"DONE: Removed={removed} | NotFound={not_found}"))
+                    # Detail per MAC (controlled)
+                    if DETAIL_EVERY == 1 or (i % DETAIL_EVERY == 0) or (i == total):
+                        self.ui_queue.put(("log", f"[{i}/{total}] {mac} -> {result} | Job Log: {job}"))
+
+                except Exception as e:
+                    errors_count += 1
+                    self.run_results.append({
+                        "timestamp": str(datetime.now()),
+                        "mac": ep.replace("%3A", ":"),
+                        "result": "ERROR_EXCEPTION",
+                        "job_log": "",
+                        "user": user,
+                        "status": -1,
+                        "error": str(e),
+                    })
+                    self.ui_queue.put(("log", f"[{i}/{total}] {ep.replace('%3A', ':')} -> ERROR_EXCEPTION ({e})"))
+
+                # Progress + ETA
+                if i % PROGRESS_UI_EVERY == 0 or i == total:
+                    elapsed = time.perf_counter() - t_loop_start
+                    avg = elapsed / max(1, i)
+                    remaining = (total - i) * avg
+                    percent = (i / total) * 100.0 if total else 0.0
+                    self.ui_queue.put(("progress", (percent, i, total, remaining)))
+
+                # Summary every 50
+                if i % 50 == 0 or i == total:
+                    self.ui_queue.put(("log", f"Progress: {i}/{total} | Removed={removed} | NotFound={not_found} | Errors={errors_count}"))
+
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+
+            # Write reports (even if cancelled)
+            self._write_reports(removed_report, summary_report)
+
+            self.ui_queue.put(("log", f"✅ Reports generated: {removed_report.name}, {summary_report.name}"))
+            self.ui_queue.put(("reports_ready", None))
+
+            # Final summary
+            processed = len(self.run_results)
+            self.ui_queue.put(("log", f"✅ DONE: Processed={processed} | Removed={removed} | NotFound={not_found} | Errors={errors_count}"))
 
         except Exception as e:
-            self.ui_queue.put(("log", f"ERROR: {e}"))
+            self.ui_queue.put(("log", f"❌ FATAL ERROR: {e}"))
         finally:
-            elapsed = time.perf_counter() - self.run_start_ts
-            self.ui_queue.put(("elapsed", elapsed))
+            end_ts = time.perf_counter()
+            start_ts = self.run_start_ts or end_ts
+            elapsed_total = end_ts - start_ts
+            self.ui_queue.put(("elapsed", elapsed_total))
             self.ui_queue.put(("done", None))
+
+    def _write_reports(self, removed_report: Path, summary_report: Path) -> None:
+        # removed_*.txt
+        removed_only = [r["mac"] for r in self.run_results if r.get("result") == "REMOVED"]
+        with open(removed_report, "w", encoding="utf-8") as f:
+            for mac in removed_only:
+                f.write(mac + "\n")
+
+        # summary_*.csv
+        with open(summary_report, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["timestamp", "user", "mac", "result", "status", "job_log", "error"]
+            )
+            writer.writeheader()
+            for r in self.run_results:
+                writer.writerow({
+                    "timestamp": r.get("timestamp", ""),
+                    "user": r.get("user", ""),
+                    "mac": r.get("mac", ""),
+                    "result": r.get("result", ""),
+                    "status": r.get("status", ""),
+                    "job_log": r.get("job_log", ""),
+                    "error": r.get("error", ""),
+                })
+
+    # =========================
+    # DOWNLOAD / REPORT BUTTONS
+    # =========================
+    def save_removed_macs(self):
+        if not self.last_removed_report or not self.last_removed_report.exists():
+            messagebox.showinfo("No report", "No removed MACs report is available yet.")
+            return
+
+        dest = filedialog.asksaveasfilename(
+            title="Save Removed MACs",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")],
+            initialfile=self.last_removed_report.name
+        )
+        if not dest:
+            return
+
+        shutil.copy2(self.last_removed_report, dest)
+        self.log(f"💾 Removed MACs saved to: {dest}")
+
+    def open_reports_folder(self):
+        self.report_dir.mkdir(exist_ok=True)
+        safe_open_folder(str(self.report_dir))
 
     # =========================
     # UI QUEUE
@@ -325,16 +580,26 @@ class App(tk.Tk):
 
                 if kind == "log":
                     self.log(payload)
+
                 elif kind == "progress":
-                    p, i, t = payload
-                    self.progress_var.set(p)
-                    self.progress_text_var.set(f"{i}/{t}")
+                    percent, i, total, remaining = payload
+                    self.progress_var.set(percent)
+                    self.progress_text_var.set(f"{i}/{total}")
+                    self.eta_text_var.set(f"ETA: {format_duration(remaining)}")
+
+                elif kind == "reports_ready":
+                    # Enable save button after reports exist
+                    self.btn_save_removed.config(state="normal")
+
                 elif kind == "elapsed":
-                    self.log(f"Total time: {format_duration(payload)}")
+                    elapsed = float(payload)
+                    self.log(f"⏱ Total time: {format_duration(elapsed)} ({elapsed:.2f}s)")
+
                 elif kind == "done":
                     self.is_running = False
-                    self.btn_execute.config(state="disabled")
-                    self.log("Job finished. Click Clear / Reset to start again.")
+                    self.btn_execute.config(state="disabled")  # must reset per your requirement
+                    self.btn_cancel.config(state="disabled")
+                    self.log("Job finished. Click 'Clear / Reset' to start a new run.")
         except queue.Empty:
             pass
 
@@ -344,13 +609,23 @@ class App(tk.Tk):
     # HELPERS
     # =========================
     def _refresh_execute_state(self):
-        ready = self.file_valid and not self.is_running
+        ready = (
+            self.file_valid and
+            bool(self.ent_user.get().strip()) and
+            bool(self.ent_pass.get().strip()) and
+            not self.is_running
+        )
         self.btn_execute.config(state="normal" if ready else "disabled")
 
     def _set_progress(self, i: int, total: int):
-        if total > 0:
-            self.progress_var.set((i / total) * 100.0)
-            self.progress_text_var.set(f"{i}/{total}")
+        if total <= 0:
+            self.progress_var.set(0.0)
+            self.progress_text_var.set("0/0")
+            self.eta_text_var.set("ETA: --")
+            return
+        self.progress_var.set((i / total) * 100.0)
+        self.progress_text_var.set(f"{i}/{total}")
+        self.eta_text_var.set("ETA: --")
 
     def clear_all(self):
         self.ent_user.delete(0, tk.END)
@@ -362,16 +637,23 @@ class App(tk.Tk):
         self.valid_endpoints.clear()
         self.file_valid = False
         self.is_running = False
+        self.cancel_event.clear()
         self.run_start_ts = None
+        self.run_results = []
 
-        limit = int(self.max_limit_var.get())
-        self.loaded_text_var.set(f"Loaded: 0 | Limit: {limit}")
+        chosen_limit = int(self.max_limit_var.get())
+        self.loaded_text_var.set(f"Loaded: 0 | Limit: {chosen_limit}")
         self._set_progress(0, 0)
+
+        self.btn_cancel.config(state="disabled")
+        self.btn_save_removed.config(state="disabled")
+
         self._refresh_execute_state()
 
     def log(self, msg: str):
         self.txt_log.insert(tk.END, msg + "\n")
 
+        # Cap lines for performance
         lines = int(self.txt_log.index("end-1c").split(".")[0])
         if lines > UI_MAX_LOG_LINES:
             self.txt_log.delete("1.0", f"{lines - UI_MAX_LOG_LINES}.0")
