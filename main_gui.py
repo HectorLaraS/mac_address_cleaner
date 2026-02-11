@@ -99,34 +99,43 @@ class App(tk.Tk):
         self.minsize(940, 580)
         self.configure(bg=COL_BG_MAIN)
 
+        # State
         self.valid_endpoints: list[str] = []
         self.file_valid = False
         self.is_running = False
         self.ui_queue = queue.Queue()
         self.cancel_event = threading.Event()
 
+        # Options
         self.max_limit_var = tk.IntVar(value=RECOMMENDED_MAX)
         self.unique_only_var = tk.BooleanVar(value=True)
         self.rate_profile_var = tk.StringVar(value="Balanced")
 
+        # Progress vars
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0/0")
         self.eta_text_var = tk.StringVar(value="ETA: --")
         self.loaded_text_var = tk.StringVar(value=f"Loaded: 0 | Limit: {RECOMMENDED_MAX}")
 
+        # Runtime
         self.run_start_ts: float | None = None
-
         self.run_job_log_name: str | None = None
         self.run_job_start_time: datetime | None = None
 
+        # Reports
         self.report_dir = Path("./reports")
         self.report_dir.mkdir(exist_ok=True)
         self.last_removed_report: Path | None = None
         self.last_summary_report: Path | None = None
 
+        # In-memory results
         self.run_results: list[dict] = []
 
         self._build_ui()
+
+        # React to max-limit changes (prevents bypass by switching after load)
+        self.max_limit_var.trace_add("write", lambda *_: self._on_limit_change())
+
         self._refresh_execute_state()
         self.after(100, self._drain_ui_queue)
 
@@ -138,8 +147,9 @@ class App(tk.Tk):
         panel.pack(fill="both", expand=True, padx=18, pady=18)
 
         panel.grid_columnconfigure((0, 1, 2, 3), weight=1)
-        panel.grid_rowconfigure(6, weight=1)
+        panel.grid_rowconfigure(5, weight=1)
 
+        # Row 0: Username / Password
         self._label(panel, "Username").grid(row=0, column=0, sticky="w", padx=14, pady=(14, 6))
         self.ent_user = self._entry(panel)
         self.ent_user.grid(row=0, column=1, sticky="we", padx=10, pady=(14, 6))
@@ -150,6 +160,7 @@ class App(tk.Tk):
         self.ent_pass.grid(row=0, column=3, sticky="we", padx=10, pady=(14, 6))
         self.ent_pass.bind("<KeyRelease>", lambda e: self._refresh_execute_state())
 
+        # Row 1: Options
         opt_row = tk.Frame(panel, bg=COL_PANEL)
         opt_row.grid(row=1, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 8))
         opt_row.grid_columnconfigure(6, weight=1)
@@ -182,6 +193,7 @@ class App(tk.Tk):
             font=("Segoe UI", 9, "bold")
         ).grid(row=0, column=6, sticky="w", padx=(16, 0))
 
+        # Row 2: File input
         self.ent_file = self._entry(panel)
         self.ent_file.grid(row=2, column=0, columnspan=3, sticky="we", padx=14, pady=(6, 10), ipady=2)
 
@@ -195,6 +207,7 @@ class App(tk.Tk):
             width=14
         ).grid(row=2, column=3, padx=10, pady=(6, 10), sticky="e")
 
+        # Row 3: Progress bar + counter + ETA
         prog_row = tk.Frame(panel, bg=COL_PANEL)
         prog_row.grid(row=3, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 10))
         prog_row.grid_columnconfigure(0, weight=1)
@@ -217,16 +230,36 @@ class App(tk.Tk):
             font=("Segoe UI", 10), width=16
         ).grid(row=0, column=2, sticky="e", padx=(12, 0))
 
+        # Row 4: Labels
         self._label(panel, "MAC Addresses to Remove").grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 6))
         self._label(panel, "Log Output").grid(row=4, column=2, columnspan=2, sticky="w", padx=14, pady=(2, 6))
 
-        self.txt_mac = tk.Text(panel, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
-        self.txt_mac.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
+        # Row 5: Text areas + vertical scrollbars
+        mac_frame = tk.Frame(panel, bg=COL_PANEL)
+        mac_frame.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
+        mac_frame.grid_rowconfigure(0, weight=1)
+        mac_frame.grid_columnconfigure(0, weight=1)
 
-        self.txt_log = tk.Text(panel, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
-        self.txt_log.grid(row=5, column=2, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
-        panel.grid_rowconfigure(5, weight=1)
+        self.txt_mac = tk.Text(mac_frame, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
+        self.txt_mac.grid(row=0, column=0, sticky="nsew")
 
+        mac_scroll_y = tk.Scrollbar(mac_frame, orient="vertical", command=self.txt_mac.yview)
+        mac_scroll_y.grid(row=0, column=1, sticky="ns")
+        self.txt_mac.configure(yscrollcommand=mac_scroll_y.set)
+
+        log_frame = tk.Frame(panel, bg=COL_PANEL)
+        log_frame.grid(row=5, column=2, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
+        log_frame.grid_rowconfigure(0, weight=1)
+        log_frame.grid_columnconfigure(0, weight=1)
+
+        self.txt_log = tk.Text(log_frame, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
+        self.txt_log.grid(row=0, column=0, sticky="nsew")
+
+        log_scroll_y = tk.Scrollbar(log_frame, orient="vertical", command=self.txt_log.yview)
+        log_scroll_y.grid(row=0, column=1, sticky="ns")
+        self.txt_log.configure(yscrollcommand=log_scroll_y.set)
+
+        # Row 7: Buttons
         bottom = tk.Frame(panel, bg=COL_PANEL)
         bottom.grid(row=7, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 10))
         bottom.grid_columnconfigure((0, 1, 2, 3), weight=1)
@@ -270,6 +303,7 @@ class App(tk.Tk):
         )
         self.btn_open_reports.grid(row=0, column=3, sticky="w", padx=(10, 0), pady=8, ipady=btn_ipady)
 
+        # Row 8: Reset
         bottom2 = tk.Frame(panel, bg=COL_PANEL)
         bottom2.grid(row=8, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 14))
         self.btn_clear = tk.Button(
@@ -289,6 +323,26 @@ class App(tk.Tk):
         return tk.Entry(parent, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", show=show or "")
 
     # =========================
+    # LIMIT CHANGE HANDLER
+    # =========================
+    def _on_limit_change(self):
+        limit = int(self.max_limit_var.get())
+        loaded = len(self.valid_endpoints)
+        self.loaded_text_var.set(f"Loaded: {loaded} | Limit: {limit}")
+
+        # If already loaded file and new limit is lower than loaded -> block execution
+        if self.file_valid and (not self.is_running) and loaded > limit:
+            self.btn_execute.config(state="disabled")
+            messagebox.showwarning(
+                "Limit exceeded",
+                f"Loaded MACs: {loaded}\nSelected limit: {limit}\n\n"
+                "Reduce the file or select a higher limit."
+            )
+            return
+
+        self._refresh_execute_state()
+
+    # =========================
     # FILE LOAD + VALIDATION
     # =========================
     def browse_txt(self):
@@ -301,6 +355,7 @@ class App(tk.Tk):
             self._show_validation_errors(errors)
             return
 
+        # Deduplicate if enabled (preserve order)
         skipped = 0
         if self.unique_only_var.get():
             seen = set()
@@ -336,6 +391,7 @@ class App(tk.Tk):
             ):
                 return
 
+        # Copy file into ./input_files
         dest_dir = Path("./input_files")
         dest_dir.mkdir(exist_ok=True)
         dest = dest_dir / Path(path).name
@@ -378,6 +434,17 @@ class App(tk.Tk):
     # EXECUTION
     # =========================
     def on_execute(self):
+        # Re-check limit right before executing (extra safety)
+        limit = int(self.max_limit_var.get())
+        loaded = len(self.valid_endpoints)
+        if self.file_valid and loaded > limit:
+            messagebox.showerror(
+                "Limit exceeded",
+                f"Loaded MACs: {loaded}\nSelected limit: {limit}\n\nReduce the file or select a higher limit."
+            )
+            self.btn_execute.config(state="disabled")
+            return
+
         if not messagebox.askyesno("Confirm", "Are you sure you want to clear these MACs?"):
             return
 
@@ -473,7 +540,7 @@ class App(tk.Tk):
                         "The operation was stopped and the application was reset."
                     )
                 }))
-            return  # IMPORTANT: stop here (no DELETE requests)
+            return  # stop here (no DELETE requests)
 
         # ---------- MAIN LOOP ----------
         try:
@@ -537,7 +604,6 @@ class App(tk.Tk):
                         }))
                         return
 
-                    # Otherwise count as error and continue
                     errors_count += 1
                     mac_colon = ep.replace("%3A", ":")
                     self.run_results.append({
@@ -683,7 +749,6 @@ class App(tk.Tk):
                 elif kind == "fatal_reset":
                     title = payload.get("title", "Error")
                     msg = payload.get("message", "An error occurred.")
-                    # Show message, then reset GUI
                     messagebox.showerror(title, msg)
                     self.clear_all()
 
@@ -701,10 +766,14 @@ class App(tk.Tk):
     # HELPERS
     # =========================
     def _refresh_execute_state(self):
+        limit = int(self.max_limit_var.get())
+        loaded = len(self.valid_endpoints)
+
         ready = (
             self.file_valid and
             bool(self.ent_user.get().strip()) and
             bool(self.ent_pass.get().strip()) and
+            (loaded <= limit) and
             not self.is_running
         )
         self.btn_execute.config(state="normal" if ready else "disabled")
