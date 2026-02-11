@@ -26,7 +26,7 @@ API_PASS = os.getenv("API_PASS")
 DEFAULT_TIMEOUT = 30
 RETRY_MAX_ATTEMPTS = 5
 RETRY_BASE_SLEEP = 1.0
-RETRY_STATUS_CODES = {429, 503}
+RETRY_STATUS_CODES = {429, 503}  # retry only for these status codes
 RETRY_EXCEPTIONS = (
     requests.exceptions.Timeout,
     requests.exceptions.ConnectionError,
@@ -54,6 +54,7 @@ if not any(isinstance(h, logging.FileHandler) and "mac_ise_execution.log" in get
     handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     exec_logger.addHandler(handler)
 
+# Silence SSL warnings
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -80,15 +81,36 @@ def _get_creds(api_user: Optional[str], api_pass: Optional[str]) -> Tuple[str, s
     return user, pwd
 
 
+def _append_job_log(job_log_name: str, line: str) -> None:
+    _ensure_dirs()
+    if not job_log_name:
+        return
+    path = os.path.join("./jobs_executed", job_log_name)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
 def _request_with_retry(method: str, url: str, *, auth: Tuple[str, str], timeout: int = DEFAULT_TIMEOUT) -> requests.Response:
+    """
+    HTTP request with exponential backoff retry for:
+      - 429 / 503
+      - timeouts / connection errors
+
+    FATAL (no retry):
+      - 401 Authentication failed
+      - 403 Forbidden / insufficient privileges
+    """
     last_exc: Optional[Exception] = None
 
     for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
         try:
             resp = requests.request(method, url, auth=auth, verify=False, timeout=timeout)
 
+            # Fatal auth / authorization errors: DO NOT RETRY
             if resp.status_code == 401:
                 raise APIException("Authentication failed (401)")
+            if resp.status_code == 403:
+                raise APIException("Authorization failed / forbidden (403)")
 
             if resp.status_code in RETRY_STATUS_CODES:
                 sleep_s = RETRY_BASE_SLEEP * (2 ** (attempt - 1))
@@ -117,18 +139,6 @@ def _request_with_retry(method: str, url: str, *, auth: Tuple[str, str], timeout
         error_logger.error(f"HTTP retry exhausted: {method} {url} | last_exception={last_exc}")
         raise APIException(f"Request failed after retries: {type(last_exc).__name__}: {last_exc}")
     raise APIException("Request failed after retries")
-
-
-def _append_job_log(job_log_name: str, line: str) -> None:
-    """
-    Append a line to the single run log under ./jobs_executed.
-    """
-    _ensure_dirs()
-    if not job_log_name:
-        return
-    path = os.path.join("./jobs_executed", job_log_name)
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
 
 
 # =========================
@@ -201,6 +211,10 @@ def get_endpoints(api_user: Optional[str] = None, api_pass: Optional[str] = None
 
 
 def create_database_copy(api_user: Optional[str] = None, api_pass: Optional[str] = None) -> str:
+    """
+    Creates a readable JSON backup of get_endpoints() under ./backup.
+    Returns the created filename.
+    """
     _ensure_dirs()
     payload = get_endpoints(api_user, api_pass)
 
@@ -222,9 +236,7 @@ def remove_endpoint(
 ) -> Tuple[datetime, str, str, str, int]:
     """
     Deletes an endpoint from ISE.
-
-    endpoint: ISE-encoded format (AA%3ABB%3A...)
-    job_log_name: SINGLE log file for the entire run (under ./jobs_executed)
+    Writes to the SINGLE run log (job_log_name).
 
     Returns:
       api_time, user, job_log_name, mac_colon, status_code
@@ -244,38 +256,29 @@ def remove_endpoint(
     url = f"{API_URL}/{endpoint}"
     t0 = time.perf_counter()
 
-    try:
-        resp = _request_with_retry("DELETE", url, auth=(user, pwd), timeout=DEFAULT_TIMEOUT)
-        status = resp.status_code
+    resp = _request_with_retry("DELETE", url, auth=(user, pwd), timeout=DEFAULT_TIMEOUT)
+    status = resp.status_code
 
-        # Write to the SINGLE run log
+    # Write to the single run log
+    if status == 200:
+        _append_job_log(job_log_name, f"{datetime.now().isoformat()} | REMOVED   | {mac_colon}")
+    elif status == 404:
+        _append_job_log(job_log_name, f"{datetime.now().isoformat()} | NOT_FOUND | {mac_colon}")
+    else:
+        _append_job_log(job_log_name, f"{datetime.now().isoformat()} | STATUS_{status} | {mac_colon}")
+
+    exec_logger.info(
+        f"user={user} | DELETE | mac={mac_colon} | status={status} | time={(time.perf_counter() - t0):.3f}s"
+    )
+
+    # history.log (audit trail)
+    history_path = os.path.join("./jobs_executed", "history.log")
+    with open(history_path, "a", encoding="utf-8") as h:
         if status == 200:
-            _append_job_log(job_log_name, f"{datetime.now().isoformat()} | REMOVED   | {mac_colon}")
+            h.write(f"{api_time} | User: {user} | Run Log: {job_log_name} | Endpoint Removed: {mac_colon}\n")
         elif status == 404:
-            _append_job_log(job_log_name, f"{datetime.now().isoformat()} | NOT_FOUND | {mac_colon}")
+            h.write(f"{api_time} | User: {user} | Run Log: {job_log_name} | Endpoint Not Found: {mac_colon}\n")
         else:
-            _append_job_log(job_log_name, f"{datetime.now().isoformat()} | STATUS_{status} | {mac_colon}")
+            h.write(f"{api_time} | User: {user} | Run Log: {job_log_name} | Endpoint Status {status}: {mac_colon}\n")
 
-        exec_logger.info(
-            f"user={user} | DELETE | mac={mac_colon} | status={status} | time={(time.perf_counter() - t0):.3f}s"
-        )
-
-        # history.log (audit trail)
-        history_path = os.path.join("./jobs_executed", "history.log")
-        with open(history_path, "a", encoding="utf-8") as h:
-            if status == 200:
-                h.write(f"{api_time} | User: {user} | Run Log: {job_log_name} | Endpoint Removed: {mac_colon}\n")
-            elif status == 404:
-                h.write(f"{api_time} | User: {user} | Run Log: {job_log_name} | Endpoint Not Found: {mac_colon}\n")
-            else:
-                h.write(f"{api_time} | User: {user} | Run Log: {job_log_name} | Endpoint Status {status}: {mac_colon}\n")
-
-        return api_time, user, job_log_name, mac_colon, status
-
-    except APIException:
-        _append_job_log(job_log_name, f"{datetime.now().isoformat()} | ERROR_APIEXCEPTION | {mac_colon}")
-        raise
-    except Exception as e:
-        error_logger.error(f"DELETE unexpected error: {e}")
-        _append_job_log(job_log_name, f"{datetime.now().isoformat()} | ERROR_EXCEPTION | {mac_colon} | {e}")
-        raise APIException(f"Unexpected error: {e}")
+    return api_time, user, job_log_name, mac_colon, status

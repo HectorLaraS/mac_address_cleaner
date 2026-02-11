@@ -10,6 +10,7 @@ import csv
 from datetime import datetime
 
 from help_functions import validate_macs, create_database_copy, remove_endpoint
+from APIException import APIException
 
 # =========================
 # CONFIG
@@ -72,16 +73,22 @@ def safe_open_folder(path: str) -> None:
 
 
 def append_run_log(job_log_name: str, line: str) -> None:
-    """
-    Local helper (GUI side) to append to the single job log.
-    help_functions also appends per MAC, but we use this for header/summary.
-    """
     if not job_log_name:
         return
     os.makedirs("./jobs_executed", exist_ok=True)
     path = os.path.join("./jobs_executed", job_log_name)
     with open(path, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def is_auth_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return ("401" in m) or ("authentication failed" in m)
+
+
+def is_forbidden_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return ("403" in m) or ("forbidden" in m) or ("authorization failed" in m)
 
 
 class App(tk.Tk):
@@ -92,38 +99,31 @@ class App(tk.Tk):
         self.minsize(940, 580)
         self.configure(bg=COL_BG_MAIN)
 
-        # State
         self.valid_endpoints: list[str] = []
         self.file_valid = False
         self.is_running = False
         self.ui_queue = queue.Queue()
         self.cancel_event = threading.Event()
 
-        # Options
         self.max_limit_var = tk.IntVar(value=RECOMMENDED_MAX)
         self.unique_only_var = tk.BooleanVar(value=True)
         self.rate_profile_var = tk.StringVar(value="Balanced")
 
-        # Progress vars
         self.progress_var = tk.DoubleVar(value=0.0)
         self.progress_text_var = tk.StringVar(value="0/0")
         self.eta_text_var = tk.StringVar(value="ETA: --")
         self.loaded_text_var = tk.StringVar(value=f"Loaded: 0 | Limit: {RECOMMENDED_MAX}")
 
-        # Runtime
         self.run_start_ts: float | None = None
 
-        # Single-run job log file name (one per process)
         self.run_job_log_name: str | None = None
         self.run_job_start_time: datetime | None = None
 
-        # Reports
         self.report_dir = Path("./reports")
         self.report_dir.mkdir(exist_ok=True)
         self.last_removed_report: Path | None = None
         self.last_summary_report: Path | None = None
 
-        # In-memory results per run (for reports)
         self.run_results: list[dict] = []
 
         self._build_ui()
@@ -140,7 +140,6 @@ class App(tk.Tk):
         panel.grid_columnconfigure((0, 1, 2, 3), weight=1)
         panel.grid_rowconfigure(6, weight=1)
 
-        # Row 0: Username / Password
         self._label(panel, "Username").grid(row=0, column=0, sticky="w", padx=14, pady=(14, 6))
         self.ent_user = self._entry(panel)
         self.ent_user.grid(row=0, column=1, sticky="we", padx=10, pady=(14, 6))
@@ -151,7 +150,6 @@ class App(tk.Tk):
         self.ent_pass.grid(row=0, column=3, sticky="we", padx=10, pady=(14, 6))
         self.ent_pass.bind("<KeyRelease>", lambda e: self._refresh_execute_state())
 
-        # Row 1: Options
         opt_row = tk.Frame(panel, bg=COL_PANEL)
         opt_row.grid(row=1, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 8))
         opt_row.grid_columnconfigure(6, weight=1)
@@ -184,7 +182,6 @@ class App(tk.Tk):
             font=("Segoe UI", 9, "bold")
         ).grid(row=0, column=6, sticky="w", padx=(16, 0))
 
-        # Row 2: File input
         self.ent_file = self._entry(panel)
         self.ent_file.grid(row=2, column=0, columnspan=3, sticky="we", padx=14, pady=(6, 10), ipady=2)
 
@@ -198,7 +195,6 @@ class App(tk.Tk):
             width=14
         ).grid(row=2, column=3, padx=10, pady=(6, 10), sticky="e")
 
-        # Row 3: Progress bar + counter + ETA
         prog_row = tk.Frame(panel, bg=COL_PANEL)
         prog_row.grid(row=3, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 10))
         prog_row.grid_columnconfigure(0, weight=1)
@@ -221,11 +217,9 @@ class App(tk.Tk):
             font=("Segoe UI", 10), width=16
         ).grid(row=0, column=2, sticky="e", padx=(12, 0))
 
-        # Row 4: Labels
         self._label(panel, "MAC Addresses to Remove").grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 6))
         self._label(panel, "Log Output").grid(row=4, column=2, columnspan=2, sticky="w", padx=14, pady=(2, 6))
 
-        # Row 5: Text
         self.txt_mac = tk.Text(panel, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
         self.txt_mac.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
 
@@ -233,7 +227,6 @@ class App(tk.Tk):
         self.txt_log.grid(row=5, column=2, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
         panel.grid_rowconfigure(5, weight=1)
 
-        # Row 7: Buttons
         bottom = tk.Frame(panel, bg=COL_PANEL)
         bottom.grid(row=7, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 10))
         bottom.grid_columnconfigure((0, 1, 2, 3), weight=1)
@@ -277,7 +270,6 @@ class App(tk.Tk):
         )
         self.btn_open_reports.grid(row=0, column=3, sticky="w", padx=(10, 0), pady=8, ipady=btn_ipady)
 
-        # Row 8: Reset (required to run again)
         bottom2 = tk.Frame(panel, bg=COL_PANEL)
         bottom2.grid(row=8, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 14))
         self.btn_clear = tk.Button(
@@ -305,12 +297,10 @@ class App(tk.Tk):
             return
 
         ok, endpoints, errors = validate_macs(path)
-
         if not ok:
             self._show_validation_errors(errors)
             return
 
-        # Deduplicate if enabled (preserve order)
         skipped = 0
         if self.unique_only_var.get():
             seen = set()
@@ -328,9 +318,7 @@ class App(tk.Tk):
         if count > chosen_limit:
             messagebox.showerror(
                 "Too Many MACs",
-                f"This file contains {count} valid MACs.\n"
-                f"Selected limit: {chosen_limit}.\n\n"
-                f"Reduce the file or change the limit."
+                f"This file contains {count} valid MACs.\nSelected limit: {chosen_limit}.\n\nReduce the file or change the limit."
             )
             return
 
@@ -348,7 +336,6 @@ class App(tk.Tk):
             ):
                 return
 
-        # Copy file into ./input_files
         dest_dir = Path("./input_files")
         dest_dir.mkdir(exist_ok=True)
         dest = dest_dir / Path(path).name
@@ -383,22 +370,9 @@ class App(tk.Tk):
 
         messagebox.showerror(
             "Validation Failed",
-            "The file contains invalid MAC addresses.\n\n"
-            "Fix these lines and try again:\n\n" +
+            "The file contains invalid MAC addresses.\n\nFix these lines and try again:\n\n" +
             "\n".join(lines) + more
         )
-
-        self.log(f"❌ Validation failed: {len(errors)} invalid line(s). Showing first {min(len(errors), MAX_SHOW)}:")
-        for ln, val, reason in preview:
-            self.log(f"  - Line {ln}: {val} ({reason})")
-
-        if messagebox.askyesno("Export Errors?", "Export an invalid MACs report to ./reports?"):
-            stamp = now_stamp()
-            out = self.report_dir / f"invalid_macs_{stamp}.txt"
-            with open(out, "w", encoding="utf-8") as f:
-                for ln, val, reason in errors:
-                    f.write(f"Line {ln}: {val} -> {reason}\n")
-            self.log(f"📝 Invalid MACs report saved: {out}")
 
     # =========================
     # EXECUTION
@@ -416,14 +390,12 @@ class App(tk.Tk):
 
         api_user = self.ent_user.get().strip()
         stamp = now_stamp()
-        # Single log per run
         self.run_job_log_name = f"job_{stamp}_{api_user}.log"
 
         self._refresh_execute_state()
         self.btn_cancel.config(state="normal")
         self.btn_save_removed.config(state="disabled")
 
-        # Write header to the run log
         append_run_log(self.run_job_log_name, "==================== JOB START ====================")
         append_run_log(self.run_job_log_name, f"Start time: {self.run_job_start_time}")
         append_run_log(self.run_job_log_name, f"User: {api_user}")
@@ -459,19 +431,52 @@ class App(tk.Tk):
         sleep_s = RATE_PROFILES.get(self.rate_profile_var.get(), 0.02)
         t_loop_start = time.perf_counter()
 
-        # Prepare report files
         stamp = now_stamp()
         removed_report = self.report_dir / f"removed_{stamp}.txt"
         summary_report = self.report_dir / f"summary_{stamp}.csv"
         self.last_removed_report = removed_report
         self.last_summary_report = summary_report
 
+        # ---------- AUTH CHECK / BACKUP (ONE REQUEST TO FAIL FAST) ----------
         try:
-            # Backup (with GUI creds)
             backup = create_database_copy(api_user=user, api_pass=pwd)
             self.ui_queue.put(("log", f"📦 Backup created: {backup}"))
             append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | BACKUP | {backup}")
+        except Exception as e:
+            err = str(e)
+            append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | BACKUP_FAILED | {err}")
 
+            if is_auth_error(err):
+                self.ui_queue.put(("fatal_reset", {
+                    "title": "Authentication Failed (401)",
+                    "message": (
+                        "The credentials you entered are invalid.\n\n"
+                        "The operation was stopped and the application was reset.\n"
+                        "Please verify your username/password and try again."
+                    )
+                }))
+            elif is_forbidden_error(err):
+                self.ui_queue.put(("fatal_reset", {
+                    "title": "Forbidden (403)",
+                    "message": (
+                        "Your account does not have permission to perform this operation (403).\n\n"
+                        "The operation was stopped and the application was reset.\n"
+                        "Please request the proper ISE API permissions and try again."
+                    )
+                }))
+            else:
+                self.ui_queue.put(("fatal_reset", {
+                    "title": "Backup Failed",
+                    "message": (
+                        "Could not create the backup before deleting MACs.\n\n"
+                        f"Error: {err}\n\n"
+                        "The operation was stopped and the application was reset."
+                    )
+                }))
+            return  # IMPORTANT: stop here (no DELETE requests)
+
+        # ---------- MAIN LOOP ----------
+        try:
             for i, ep in enumerate(self.valid_endpoints, start=1):
                 if self.cancel_event.is_set():
                     self.ui_queue.put(("log", "⛔ Run cancelled by user. Generating partial reports..."))
@@ -508,6 +513,44 @@ class App(tk.Tk):
                     if DETAIL_EVERY == 1 or (i % DETAIL_EVERY == 0) or (i == total):
                         self.ui_queue.put(("log", f"[{i}/{total}] {mac} -> {result}"))
 
+                except APIException as ae:
+                    err = str(ae)
+                    append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | API_ERROR | {err}")
+
+                    # Fail fast on 401/403 (do not spam API)
+                    if is_auth_error(err):
+                        self.ui_queue.put(("fatal_reset", {
+                            "title": "Authentication Failed (401)",
+                            "message": (
+                                "Authentication failed during the deletion process.\n\n"
+                                "The operation was stopped and the application was reset."
+                            )
+                        }))
+                        return
+                    if is_forbidden_error(err):
+                        self.ui_queue.put(("fatal_reset", {
+                            "title": "Forbidden (403)",
+                            "message": (
+                                "Authorization failed (403) during the deletion process.\n\n"
+                                "The operation was stopped and the application was reset."
+                            )
+                        }))
+                        return
+
+                    # Otherwise count as error and continue
+                    errors_count += 1
+                    mac_colon = ep.replace("%3A", ":")
+                    self.run_results.append({
+                        "timestamp": str(datetime.now()),
+                        "mac": mac_colon,
+                        "result": "ERROR_APIEXCEPTION",
+                        "job_log": self.run_job_log_name or "",
+                        "user": user,
+                        "status": -1,
+                        "error": err,
+                    })
+                    self.ui_queue.put(("log", f"[{i}/{total}] {mac_colon} -> ERROR ({err})"))
+
                 except Exception as e:
                     errors_count += 1
                     mac_colon = ep.replace("%3A", ":")
@@ -523,7 +566,6 @@ class App(tk.Tk):
                     self.ui_queue.put(("log", f"[{i}/{total}] {mac_colon} -> ERROR_EXCEPTION ({e})"))
                     append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | ERROR_EXCEPTION | {mac_colon} | {e}")
 
-                # Progress + ETA
                 if i % PROGRESS_UI_EVERY == 0 or i == total:
                     elapsed = time.perf_counter() - t_loop_start
                     avg = elapsed / max(1, i)
@@ -531,7 +573,6 @@ class App(tk.Tk):
                     percent = (i / total) * 100.0 if total else 0.0
                     self.ui_queue.put(("progress", (percent, i, total, remaining)))
 
-                # Summary every 50
                 if i % 50 == 0 or i == total:
                     self.ui_queue.put(("log", f"Progress: {i}/{total} | Removed={removed} | NotFound={not_found} | Errors={errors_count}"))
                     append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | SUMMARY | i={i}/{total} removed={removed} not_found={not_found} errors={errors_count}")
@@ -539,7 +580,6 @@ class App(tk.Tk):
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
-            # Write reports
             self._write_reports(removed_report, summary_report)
             self.ui_queue.put(("log", f"✅ Reports generated: {removed_report.name}, {summary_report.name}"))
             self.ui_queue.put(("reports_ready", None))
@@ -557,7 +597,6 @@ class App(tk.Tk):
             elapsed_total = end_ts - start_ts
             self.ui_queue.put(("elapsed", elapsed_total))
 
-            # Append JOB SUMMARY to single run log
             end_dt = datetime.now()
             append_run_log(self.run_job_log_name or "", "--------------------------------------------------")
             append_run_log(self.run_job_log_name or "", "==================== JOB SUMMARY ==================")
@@ -641,9 +680,16 @@ class App(tk.Tk):
                     elapsed = float(payload)
                     self.log(f"⏱ Total time: {format_duration(elapsed)} ({elapsed:.2f}s)")
 
+                elif kind == "fatal_reset":
+                    title = payload.get("title", "Error")
+                    msg = payload.get("message", "An error occurred.")
+                    # Show message, then reset GUI
+                    messagebox.showerror(title, msg)
+                    self.clear_all()
+
                 elif kind == "done":
                     self.is_running = False
-                    self.btn_execute.config(state="disabled")  # per your requirement
+                    self.btn_execute.config(state="disabled")  # must reset per your rule
                     self.btn_cancel.config(state="disabled")
                     self.log("Job finished. Click 'Clear / Reset' to start a new run.")
         except queue.Empty:
@@ -685,6 +731,7 @@ class App(tk.Tk):
         self.is_running = False
         self.cancel_event.clear()
         self.run_start_ts = None
+
         self.run_job_log_name = None
         self.run_job_start_time = None
         self.run_results = []
