@@ -23,9 +23,9 @@ API_PASS = os.getenv("API_PASS")
 # =========================
 # HTTP / RETRY SETTINGS
 # =========================
-DEFAULT_TIMEOUT = 30  # seconds
+DEFAULT_TIMEOUT = 30
 RETRY_MAX_ATTEMPTS = 5
-RETRY_BASE_SLEEP = 1.0  # seconds (exponential backoff)
+RETRY_BASE_SLEEP = 1.0
 RETRY_STATUS_CODES = {429, 503}
 RETRY_EXCEPTIONS = (
     requests.exceptions.Timeout,
@@ -48,14 +48,12 @@ error_logger = logging.getLogger("MAC_ISE_ERROR")
 exec_logger = logging.getLogger("MAC_ISE_EXEC")
 exec_logger.setLevel(logging.INFO)
 
-# Avoid duplicate handlers on reload
 if not any(isinstance(h, logging.FileHandler) and "mac_ise_execution.log" in getattr(h, "baseFilename", "")
            for h in exec_logger.handlers):
     handler = logging.FileHandler("mac_ise_execution.log")
     handler.setFormatter(logging.Formatter("%(asctime)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     exec_logger.addHandler(handler)
 
-# Silence SSL warnings (common in internal ISE deployments)
 try:
     import urllib3
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -79,37 +77,20 @@ def _get_creds(api_user: Optional[str], api_pass: Optional[str]) -> Tuple[str, s
 
     if not user or not pwd:
         raise APIException("Missing API credentials (username/password)")
-
     return user, pwd
 
 
-def _build_job_name(api_time: datetime, user: str) -> str:
-    # same-second collisions are possible; add a short suffix
-    suffix = f"{int(time.time() * 1000) % 100000}"
-    return f"{api_time.strftime('%Y%m%d_%H%M%S')}_{user}_{suffix}.log"
-
-
 def _request_with_retry(method: str, url: str, *, auth: Tuple[str, str], timeout: int = DEFAULT_TIMEOUT) -> requests.Response:
-    """
-    Performs an HTTP request with exponential backoff retry for:
-      - 429 / 503
-      - timeouts / connection errors
-
-    Returns the final response if no fatal condition occurs.
-    Raises APIException on repeated failures.
-    """
     last_exc: Optional[Exception] = None
 
     for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
         try:
             resp = requests.request(method, url, auth=auth, verify=False, timeout=timeout)
 
-            # auth errors are fatal
             if resp.status_code == 401:
                 raise APIException("Authentication failed (401)")
 
             if resp.status_code in RETRY_STATUS_CODES:
-                # retry with backoff
                 sleep_s = RETRY_BASE_SLEEP * (2 ** (attempt - 1))
                 exec_logger.info(
                     f"retryable_status={resp.status_code} | attempt={attempt}/{RETRY_MAX_ATTEMPTS} | "
@@ -121,7 +102,6 @@ def _request_with_retry(method: str, url: str, *, auth: Tuple[str, str], timeout
             return resp
 
         except APIException:
-            # re-raise our own controlled exception
             raise
         except RETRY_EXCEPTIONS as e:
             last_exc = e
@@ -133,29 +113,28 @@ def _request_with_retry(method: str, url: str, *, auth: Tuple[str, str], timeout
             time.sleep(sleep_s)
             continue
 
-    # if we got here, retries exhausted
     if last_exc:
         error_logger.error(f"HTTP retry exhausted: {method} {url} | last_exception={last_exc}")
         raise APIException(f"Request failed after retries: {type(last_exc).__name__}: {last_exc}")
     raise APIException("Request failed after retries")
 
 
+def _append_job_log(job_log_name: str, line: str) -> None:
+    """
+    Append a line to the single run log under ./jobs_executed.
+    """
+    _ensure_dirs()
+    if not job_log_name:
+        return
+    path = os.path.join("./jobs_executed", job_log_name)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
 # =========================
 # MAC NORMALIZATION
 # =========================
 def normalize_mac(mac: str, output: str = "plain") -> str:
-    """
-    Normalize MAC address.
-
-    Accepted formats:
-      - AA:AA:BB:BB:CC:CC
-      - aaaa.bbbb.cccc
-
-    output:
-      - plain  -> AAAABBBBCCCC
-      - colon  -> AA:AA:BB:BB:CC:CC
-      - ise    -> AA%3AAA%3ABB%3ABB%3ACC%3ACC
-    """
     mac = (mac or "").strip()
 
     pattern_colon = re.compile(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$')
@@ -186,14 +165,6 @@ def normalize_mac(mac: str, output: str = "plain") -> str:
 # VALIDATION (FRIENDLY)
 # =========================
 def validate_macs(file_location: str) -> Tuple[bool, List[str], List[Tuple[int, str, str]]]:
-    """
-    Validates MAC addresses from a text file.
-
-    Returns:
-      ok        -> bool
-      endpoints -> list of MACs in ISE format (AA%3ABB%3A...)
-      errors    -> list of (line_number, raw_value, reason)
-    """
     endpoints: List[str] = []
     errors: List[Tuple[int, str, str]] = []
 
@@ -202,7 +173,6 @@ def validate_macs(file_location: str) -> Tuple[bool, List[str], List[Tuple[int, 
             value = raw.strip()
             if not value:
                 continue
-
             try:
                 endpoints.append(normalize_mac(value, "ise"))
             except Exception as e:
@@ -220,10 +190,9 @@ def get_endpoints(api_user: Optional[str] = None, api_pass: Optional[str] = None
         raise APIException("API_URL not configured in .env")
 
     user, pwd = _get_creds(api_user, api_pass)
-
     t0 = time.perf_counter()
-    resp = _request_with_retry("GET", API_URL, auth=(user, pwd), timeout=DEFAULT_TIMEOUT)
 
+    resp = _request_with_retry("GET", API_URL, auth=(user, pwd), timeout=DEFAULT_TIMEOUT)
     if resp.status_code != 200:
         raise APIException(f"Unexpected response: {resp.status_code}")
 
@@ -232,10 +201,6 @@ def get_endpoints(api_user: Optional[str] = None, api_pass: Optional[str] = None
 
 
 def create_database_copy(api_user: Optional[str] = None, api_pass: Optional[str] = None) -> str:
-    """
-    Creates a readable JSON backup of get_endpoints() under ./backup.
-    Returns the created filename.
-    """
     _ensure_dirs()
     payload = get_endpoints(api_user, api_pass)
 
@@ -252,12 +217,15 @@ def create_database_copy(api_user: Optional[str] = None, api_pass: Optional[str]
 def remove_endpoint(
     endpoint: str,
     api_user: Optional[str] = None,
-    api_pass: Optional[str] = None
+    api_pass: Optional[str] = None,
+    job_log_name: str = ""
 ) -> Tuple[datetime, str, str, str, int]:
     """
     Deletes an endpoint from ISE.
 
-    endpoint: must be in ISE-encoded format (AA%3ABB%3A...)
+    endpoint: ISE-encoded format (AA%3ABB%3A...)
+    job_log_name: SINGLE log file for the entire run (under ./jobs_executed)
+
     Returns:
       api_time, user, job_log_name, mac_colon, status_code
     """
@@ -267,16 +235,12 @@ def remove_endpoint(
         raise APIException("API_URL not configured in .env")
 
     user, pwd = _get_creds(api_user, api_pass)
-
     endpoint = (endpoint or "").strip()
     if not endpoint:
         raise APIException("Endpoint value is empty")
 
     mac_colon = endpoint.replace("%3A", ":")
     api_time = datetime.now()
-    job_name = _build_job_name(api_time, user)
-    job_path = os.path.join("./jobs_executed", job_name)
-
     url = f"{API_URL}/{endpoint}"
     t0 = time.perf_counter()
 
@@ -284,35 +248,34 @@ def remove_endpoint(
         resp = _request_with_retry("DELETE", url, auth=(user, pwd), timeout=DEFAULT_TIMEOUT)
         status = resp.status_code
 
-        # Write job log
-        with open(job_path, "a", encoding="utf-8") as log:
-            if status == 200:
-                log.write(f"{datetime.now().isoformat()} | REMOVED | {mac_colon}\n")
-            elif status == 404:
-                log.write(f"{datetime.now().isoformat()} | NOT_FOUND | {mac_colon}\n")
-            else:
-                log.write(f"{datetime.now().isoformat()} | STATUS_{status} | {mac_colon}\n")
+        # Write to the SINGLE run log
+        if status == 200:
+            _append_job_log(job_log_name, f"{datetime.now().isoformat()} | REMOVED   | {mac_colon}")
+        elif status == 404:
+            _append_job_log(job_log_name, f"{datetime.now().isoformat()} | NOT_FOUND | {mac_colon}")
+        else:
+            _append_job_log(job_log_name, f"{datetime.now().isoformat()} | STATUS_{status} | {mac_colon}")
 
-        # Execution log
         exec_logger.info(
             f"user={user} | DELETE | mac={mac_colon} | status={status} | time={(time.perf_counter() - t0):.3f}s"
         )
 
-        # History log (audit)
+        # history.log (audit trail)
         history_path = os.path.join("./jobs_executed", "history.log")
         with open(history_path, "a", encoding="utf-8") as h:
             if status == 200:
-                h.write(f"{api_time} | User: {user} | Detailed Log: {job_name} | Endpoint Removed: {mac_colon}\n")
+                h.write(f"{api_time} | User: {user} | Run Log: {job_log_name} | Endpoint Removed: {mac_colon}\n")
             elif status == 404:
-                h.write(f"{api_time} | User: {user} | Detailed Log: {job_name} | Endpoint Not Found: {mac_colon}\n")
+                h.write(f"{api_time} | User: {user} | Run Log: {job_log_name} | Endpoint Not Found: {mac_colon}\n")
             else:
-                h.write(f"{api_time} | User: {user} | Detailed Log: {job_name} | Endpoint Status {status}: {mac_colon}\n")
+                h.write(f"{api_time} | User: {user} | Run Log: {job_log_name} | Endpoint Status {status}: {mac_colon}\n")
 
-        return api_time, user, job_name, mac_colon, status
+        return api_time, user, job_log_name, mac_colon, status
 
     except APIException:
-        # already logged by retry helper or auth
+        _append_job_log(job_log_name, f"{datetime.now().isoformat()} | ERROR_APIEXCEPTION | {mac_colon}")
         raise
     except Exception as e:
         error_logger.error(f"DELETE unexpected error: {e}")
+        _append_job_log(job_log_name, f"{datetime.now().isoformat()} | ERROR_EXCEPTION | {mac_colon} | {e}")
         raise APIException(f"Unexpected error: {e}")

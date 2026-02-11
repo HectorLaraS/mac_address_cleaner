@@ -19,10 +19,9 @@ ALLOWED_MAX = 5000
 WARN_MACS = 1000
 
 UI_MAX_LOG_LINES = 2500
-DETAIL_EVERY = 1               # 1 = every MAC; 5 = every 5
-PROGRESS_UI_EVERY = 5          # update progress UI every N MACs
+DETAIL_EVERY = 1
+PROGRESS_UI_EVERY = 5
 
-# Rate limit presets (sleep between calls)
 RATE_PROFILES = {
     "Fast": 0.00,
     "Balanced": 0.02,
@@ -66,19 +65,31 @@ def safe_open_folder(path: str) -> None:
     try:
         os.startfile(os.path.abspath(path))  # Windows
     except Exception:
-        # fallback: try explorer
         try:
             os.system(f'explorer "{os.path.abspath(path)}"')
         except Exception:
             pass
 
 
+def append_run_log(job_log_name: str, line: str) -> None:
+    """
+    Local helper (GUI side) to append to the single job log.
+    help_functions also appends per MAC, but we use this for header/summary.
+    """
+    if not job_log_name:
+        return
+    os.makedirs("./jobs_executed", exist_ok=True)
+    path = os.path.join("./jobs_executed", job_log_name)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("MAC Address Cleaner")
-        self.geometry("1020x640")
-        self.minsize(940, 560)
+        self.geometry("1020x650")
+        self.minsize(940, 580)
         self.configure(bg=COL_BG_MAIN)
 
         # State
@@ -88,7 +99,7 @@ class App(tk.Tk):
         self.ui_queue = queue.Queue()
         self.cancel_event = threading.Event()
 
-        # Limits + options
+        # Options
         self.max_limit_var = tk.IntVar(value=RECOMMENDED_MAX)
         self.unique_only_var = tk.BooleanVar(value=True)
         self.rate_profile_var = tk.StringVar(value="Balanced")
@@ -102,13 +113,17 @@ class App(tk.Tk):
         # Runtime
         self.run_start_ts: float | None = None
 
-        # Report paths (set per run)
+        # Single-run job log file name (one per process)
+        self.run_job_log_name: str | None = None
+        self.run_job_start_time: datetime | None = None
+
+        # Reports
         self.report_dir = Path("./reports")
         self.report_dir.mkdir(exist_ok=True)
         self.last_removed_report: Path | None = None
         self.last_summary_report: Path | None = None
 
-        # In-memory results per run
+        # In-memory results per run (for reports)
         self.run_results: list[dict] = []
 
         self._build_ui()
@@ -136,7 +151,7 @@ class App(tk.Tk):
         self.ent_pass.grid(row=0, column=3, sticky="we", padx=10, pady=(14, 6))
         self.ent_pass.bind("<KeyRelease>", lambda e: self._refresh_execute_state())
 
-        # Row 1: Options (limit, unique, rate profile)
+        # Row 1: Options
         opt_row = tk.Frame(panel, bg=COL_PANEL)
         opt_row.grid(row=1, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 8))
         opt_row.grid_columnconfigure(6, weight=1)
@@ -169,7 +184,7 @@ class App(tk.Tk):
             font=("Segoe UI", 9, "bold")
         ).grid(row=0, column=6, sticky="w", padx=(16, 0))
 
-        # Row 2: File bar + Browse
+        # Row 2: File input
         self.ent_file = self._entry(panel)
         self.ent_file.grid(row=2, column=0, columnspan=3, sticky="we", padx=14, pady=(6, 10), ipady=2)
 
@@ -210,18 +225,17 @@ class App(tk.Tk):
         self._label(panel, "MAC Addresses to Remove").grid(row=4, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 6))
         self._label(panel, "Log Output").grid(row=4, column=2, columnspan=2, sticky="w", padx=14, pady=(2, 6))
 
-        # Row 5-6: Text areas
+        # Row 5: Text
         self.txt_mac = tk.Text(panel, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
         self.txt_mac.grid(row=5, column=0, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
 
         self.txt_log = tk.Text(panel, bg=COL_ENTRY_BG, fg=COL_ENTRY_FG, bd=1, relief="solid", wrap="none")
         self.txt_log.grid(row=5, column=2, columnspan=2, sticky="nsew", padx=14, pady=(0, 12))
-
         panel.grid_rowconfigure(5, weight=1)
 
-        # Row 7: Bottom buttons
+        # Row 7: Buttons
         bottom = tk.Frame(panel, bg=COL_PANEL)
-        bottom.grid(row=7, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 14))
+        bottom.grid(row=7, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 10))
         bottom.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         btn_w = 20
@@ -263,7 +277,7 @@ class App(tk.Tk):
         )
         self.btn_open_reports.grid(row=0, column=3, sticky="w", padx=(10, 0), pady=8, ipady=btn_ipady)
 
-        # Clear button below (keeps your "must reset to run again" requirement)
+        # Row 8: Reset (required to run again)
         bottom2 = tk.Frame(panel, bg=COL_PANEL)
         bottom2.grid(row=8, column=0, columnspan=4, sticky="we", padx=14, pady=(0, 14))
         self.btn_clear = tk.Button(
@@ -297,6 +311,7 @@ class App(tk.Tk):
             return
 
         # Deduplicate if enabled (preserve order)
+        skipped = 0
         if self.unique_only_var.get():
             seen = set()
             unique = []
@@ -306,8 +321,6 @@ class App(tk.Tk):
                     unique.append(ep)
             skipped = len(endpoints) - len(unique)
             endpoints = unique
-        else:
-            skipped = 0
 
         count = len(endpoints)
         chosen_limit = int(self.max_limit_var.get())
@@ -359,7 +372,6 @@ class App(tk.Tk):
         if skipped:
             self.log(f"ℹ️ Duplicates removed: {skipped}")
 
-        # Save buttons disabled until run ends
         self.btn_save_removed.config(state="disabled")
         self._refresh_execute_state()
 
@@ -376,13 +388,11 @@ class App(tk.Tk):
             "\n".join(lines) + more
         )
 
-        # Also log the summary
         self.log(f"❌ Validation failed: {len(errors)} invalid line(s). Showing first {min(len(errors), MAX_SHOW)}:")
         for ln, val, reason in preview:
             self.log(f"  - Line {ln}: {val} ({reason})")
 
-        # Optional: offer to export invalid lines report
-        if messagebox.askyesno("Export Errors?", "Do you want to export an invalid MACs report to ./reports?"):
+        if messagebox.askyesno("Export Errors?", "Export an invalid MACs report to ./reports?"):
             stamp = now_stamp()
             out = self.report_dir / f"invalid_macs_{stamp}.txt"
             with open(out, "w", encoding="utf-8") as f:
@@ -402,12 +412,29 @@ class App(tk.Tk):
         self.run_results = []
 
         self.run_start_ts = time.perf_counter()
+        self.run_job_start_time = datetime.now()
+
+        api_user = self.ent_user.get().strip()
+        stamp = now_stamp()
+        # Single log per run
+        self.run_job_log_name = f"job_{stamp}_{api_user}.log"
+
         self._refresh_execute_state()
         self.btn_cancel.config(state="normal")
         self.btn_save_removed.config(state="disabled")
 
+        # Write header to the run log
+        append_run_log(self.run_job_log_name, "==================== JOB START ====================")
+        append_run_log(self.run_job_log_name, f"Start time: {self.run_job_start_time}")
+        append_run_log(self.run_job_log_name, f"User: {api_user}")
+        append_run_log(self.run_job_log_name, f"Input file: {self.ent_file.get().strip()}")
+        append_run_log(self.run_job_log_name, f"Total MACs: {len(self.valid_endpoints)}")
+        append_run_log(self.run_job_log_name, f"Unique only: {self.unique_only_var.get()}")
+        append_run_log(self.run_job_log_name, f"Rate profile: {self.rate_profile_var.get()} (sleep={RATE_PROFILES[self.rate_profile_var.get()]}s)")
+        append_run_log(self.run_job_log_name, "--------------------------------------------------")
+
         self.log("▶ Job started...")
-        self.log(f"Rate profile: {self.rate_profile_var.get()} (sleep={RATE_PROFILES[self.rate_profile_var.get()]}s)")
+        self.log(f"Run log: ./jobs_executed/{self.run_job_log_name}")
 
         threading.Thread(target=self._worker, daemon=True).start()
 
@@ -418,6 +445,7 @@ class App(tk.Tk):
             self.cancel_event.set()
             self.btn_cancel.config(state="disabled")
             self.log("⛔ Cancel requested...")
+            append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | CANCEL_REQUESTED")
 
     def _worker(self):
         user = self.ent_user.get().strip()
@@ -431,7 +459,7 @@ class App(tk.Tk):
         sleep_s = RATE_PROFILES.get(self.rate_profile_var.get(), 0.02)
         t_loop_start = time.perf_counter()
 
-        # Prepare report files for this run
+        # Prepare report files
         stamp = now_stamp()
         removed_report = self.report_dir / f"removed_{stamp}.txt"
         summary_report = self.report_dir / f"summary_{stamp}.csv"
@@ -439,17 +467,24 @@ class App(tk.Tk):
         self.last_summary_report = summary_report
 
         try:
-            # Backup (uses GUI creds)
+            # Backup (with GUI creds)
             backup = create_database_copy(api_user=user, api_pass=pwd)
             self.ui_queue.put(("log", f"📦 Backup created: {backup}"))
+            append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | BACKUP | {backup}")
 
             for i, ep in enumerate(self.valid_endpoints, start=1):
                 if self.cancel_event.is_set():
                     self.ui_queue.put(("log", "⛔ Run cancelled by user. Generating partial reports..."))
+                    append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | CANCELLED")
                     break
 
                 try:
-                    api_time, api_user_used, job, mac, status = remove_endpoint(ep, api_user=user, api_pass=pwd)
+                    api_time, api_user_used, job_log_name, mac, status = remove_endpoint(
+                        ep,
+                        api_user=user,
+                        api_pass=pwd,
+                        job_log_name=self.run_job_log_name or ""
+                    )
 
                     if status == 200:
                         removed += 1
@@ -465,27 +500,28 @@ class App(tk.Tk):
                         "timestamp": str(api_time),
                         "mac": mac,
                         "result": result,
-                        "job_log": job,
+                        "job_log": job_log_name,
                         "user": api_user_used,
                         "status": status,
                     })
 
-                    # Detail per MAC (controlled)
                     if DETAIL_EVERY == 1 or (i % DETAIL_EVERY == 0) or (i == total):
-                        self.ui_queue.put(("log", f"[{i}/{total}] {mac} -> {result} | Job Log: {job}"))
+                        self.ui_queue.put(("log", f"[{i}/{total}] {mac} -> {result}"))
 
                 except Exception as e:
                     errors_count += 1
+                    mac_colon = ep.replace("%3A", ":")
                     self.run_results.append({
                         "timestamp": str(datetime.now()),
-                        "mac": ep.replace("%3A", ":"),
+                        "mac": mac_colon,
                         "result": "ERROR_EXCEPTION",
-                        "job_log": "",
+                        "job_log": self.run_job_log_name or "",
                         "user": user,
                         "status": -1,
                         "error": str(e),
                     })
-                    self.ui_queue.put(("log", f"[{i}/{total}] {ep.replace('%3A', ':')} -> ERROR_EXCEPTION ({e})"))
+                    self.ui_queue.put(("log", f"[{i}/{total}] {mac_colon} -> ERROR_EXCEPTION ({e})"))
+                    append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | ERROR_EXCEPTION | {mac_colon} | {e}")
 
                 # Progress + ETA
                 if i % PROGRESS_UI_EVERY == 0 or i == total:
@@ -498,37 +534,48 @@ class App(tk.Tk):
                 # Summary every 50
                 if i % 50 == 0 or i == total:
                     self.ui_queue.put(("log", f"Progress: {i}/{total} | Removed={removed} | NotFound={not_found} | Errors={errors_count}"))
+                    append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | SUMMARY | i={i}/{total} removed={removed} not_found={not_found} errors={errors_count}")
 
                 if sleep_s > 0:
                     time.sleep(sleep_s)
 
-            # Write reports (even if cancelled)
+            # Write reports
             self._write_reports(removed_report, summary_report)
-
             self.ui_queue.put(("log", f"✅ Reports generated: {removed_report.name}, {summary_report.name}"))
             self.ui_queue.put(("reports_ready", None))
 
-            # Final summary
             processed = len(self.run_results)
             self.ui_queue.put(("log", f"✅ DONE: Processed={processed} | Removed={removed} | NotFound={not_found} | Errors={errors_count}"))
 
         except Exception as e:
             self.ui_queue.put(("log", f"❌ FATAL ERROR: {e}"))
+            append_run_log(self.run_job_log_name or "", f"{datetime.now().isoformat()} | FATAL_ERROR | {e}")
+
         finally:
             end_ts = time.perf_counter()
             start_ts = self.run_start_ts or end_ts
             elapsed_total = end_ts - start_ts
             self.ui_queue.put(("elapsed", elapsed_total))
+
+            # Append JOB SUMMARY to single run log
+            end_dt = datetime.now()
+            append_run_log(self.run_job_log_name or "", "--------------------------------------------------")
+            append_run_log(self.run_job_log_name or "", "==================== JOB SUMMARY ==================")
+            append_run_log(self.run_job_log_name or "", f"End time: {end_dt}")
+            append_run_log(self.run_job_log_name or "", f"Duration: {format_duration(elapsed_total)} ({elapsed_total:.2f}s)")
+            append_run_log(self.run_job_log_name or "", f"Totals: processed={len(self.run_results)} removed={removed} not_found={not_found} errors={errors_count}")
+            append_run_log(self.run_job_log_name or "", f"Rate profile: {self.rate_profile_var.get()} (sleep={RATE_PROFILES[self.rate_profile_var.get()]}s)")
+            append_run_log(self.run_job_log_name or "", f"Reports: {removed_report.name}, {summary_report.name}")
+            append_run_log(self.run_job_log_name or "", "===================== JOB END =====================")
+
             self.ui_queue.put(("done", None))
 
     def _write_reports(self, removed_report: Path, summary_report: Path) -> None:
-        # removed_*.txt
         removed_only = [r["mac"] for r in self.run_results if r.get("result") == "REMOVED"]
         with open(removed_report, "w", encoding="utf-8") as f:
             for mac in removed_only:
                 f.write(mac + "\n")
 
-        # summary_*.csv
         with open(summary_report, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
                 f,
@@ -547,7 +594,7 @@ class App(tk.Tk):
                 })
 
     # =========================
-    # DOWNLOAD / REPORT BUTTONS
+    # REPORT BUTTONS
     # =========================
     def save_removed_macs(self):
         if not self.last_removed_report or not self.last_removed_report.exists():
@@ -588,7 +635,6 @@ class App(tk.Tk):
                     self.eta_text_var.set(f"ETA: {format_duration(remaining)}")
 
                 elif kind == "reports_ready":
-                    # Enable save button after reports exist
                     self.btn_save_removed.config(state="normal")
 
                 elif kind == "elapsed":
@@ -597,7 +643,7 @@ class App(tk.Tk):
 
                 elif kind == "done":
                     self.is_running = False
-                    self.btn_execute.config(state="disabled")  # must reset per your requirement
+                    self.btn_execute.config(state="disabled")  # per your requirement
                     self.btn_cancel.config(state="disabled")
                     self.log("Job finished. Click 'Clear / Reset' to start a new run.")
         except queue.Empty:
@@ -639,6 +685,8 @@ class App(tk.Tk):
         self.is_running = False
         self.cancel_event.clear()
         self.run_start_ts = None
+        self.run_job_log_name = None
+        self.run_job_start_time = None
         self.run_results = []
 
         chosen_limit = int(self.max_limit_var.get())
@@ -653,7 +701,6 @@ class App(tk.Tk):
     def log(self, msg: str):
         self.txt_log.insert(tk.END, msg + "\n")
 
-        # Cap lines for performance
         lines = int(self.txt_log.index("end-1c").split(".")[0])
         if lines > UI_MAX_LOG_LINES:
             self.txt_log.delete("1.0", f"{lines - UI_MAX_LOG_LINES}.0")
